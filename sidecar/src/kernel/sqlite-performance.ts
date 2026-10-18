@@ -69,9 +69,11 @@ export const instrumentMainConnection = <Connection extends Database>(
 ): Connection => {
   // Bun caches prepared statements by SQL; keep the cached identity through this proxy.
   const statementProxies = new WeakMap<Statement, Statement>()
+  const overrides = new Map<PropertyKey, unknown>()
 
   return new Proxy(database, {
     get: (target, property) => {
+      if (overrides.has(property)) return overrides.get(property)
       // Keep explicit overrides visible to instrumentation consumers such as spies.
       if (Object.hasOwn(target, property)) return Reflect.get(target, property, target) as unknown
 
@@ -93,6 +95,24 @@ export const instrumentMainConnection = <Connection extends Database>(
       if (typeof value === "function") return value.bind(target)
 
       return value
+    },
+    set: (target, property, value) => {
+      const updated = Reflect.set(target, property, value, target)
+      if (updated) overrides.set(property, value)
+
+      return updated
+    },
+    defineProperty: (target, property, descriptor) => {
+      const updated = Reflect.defineProperty(target, property, descriptor)
+      if (updated && "value" in descriptor) overrides.set(property, descriptor.value)
+
+      return updated
+    },
+    deleteProperty: (target, property) => {
+      const deleted = Reflect.deleteProperty(target, property)
+      if (deleted) overrides.delete(property)
+
+      return deleted
     },
   }) as Connection
 }
