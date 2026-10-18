@@ -118,7 +118,7 @@ test("long agentic turns bound durable commits, row mutations and physical WAL b
       if (event.type === "message.delta") streamed.push(event.delta)
       if (event.type === "message.parts") publishedProgress += event.parts.length
     })
-    store.flushWrites?.()
+    await store.flushWritesAsync?.()
     database.exec("PRAGMA wal_autocheckpoint = 0; PRAGMA wal_checkpoint(TRUNCATE)")
     const changesBefore = totalChanges(database)
     const started = performance.now()
@@ -133,14 +133,20 @@ test("long agentic turns bound durable commits, row mutations and physical WAL b
       progress = target
       command = record(run, { ...command, outputTail: `${progress}: `.padEnd(12 * 1024, "x") }, false, !batched)
       if (batched) store.appendParts?.({ threadId: "t", messageId: "reply", parts: [{ partIndex: 1, part: command }] })
-      else
-        store.updateMessage({
+      else {
+        const input = {
           threadId: "t",
           messageId: "reply",
-          patch: { text, parts: [{ type: "text", text }, command] },
-        })
+          patch: { text, parts: [{ type: "text" as const, text }, command] },
+        }
+        if (store.updateMessageAsync) await store.updateMessageAsync(input)
+        else {
+          await store.flushWritesAsync?.()
+          store.updateMessage(input)
+        }
+      }
     }
-    store.flushWrites?.()
+    await store.flushWritesAsync?.()
     // Finalization supplies a full snapshot; verify live delivery before that
     // snapshot could conceal a writer that silently dropped accepted work.
     expect(streamed.join("")).toBe(delta.repeat(2_000))
@@ -184,7 +190,7 @@ test("long agentic turns bound durable commits, row mutations and physical WAL b
       expect(reply?.parts[1]).toMatchObject({ outputAttachmentId: expect.any(String), outputBytes: 12 * 1024 })
     }
   } finally {
-    runtime.stop()
+    await runtime.stop()
     rmSync(root, { recursive: true, force: true })
   }
 }, 30_000)

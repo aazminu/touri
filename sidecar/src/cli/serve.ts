@@ -99,7 +99,7 @@ const startServer = async (options: ServeOptions, stopStderr: () => Promise<void
       runtime.emitHostNotification({ method: "app.willQuit", params: {} })
       await runtime.kernel.services.use("vm.shutdown")?.()
       clearServeInfo(options.dataDir)
-      runtime.stop()
+      await runtime.stop()
       store.close()
       lease.release()
       await stopStderr()

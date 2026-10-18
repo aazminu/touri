@@ -1,10 +1,9 @@
 import type { Database } from "bun:sqlite"
 import type { Kernel, Message, MessagePart, StoreApi, Thread, UiEvent } from "@touri/contracts"
 import type { PerformanceStageRunner } from "../kernel/performance"
-import { captureTranscript } from "../kernel/transcript-events"
-import { materializeTranscript } from "../kernel/transcript-storage"
 import { createStreamPartWriter } from "./stream-parts"
-import { appendRejection, recordTranscriptRejection } from "./transcript-rejections"
+import { createStreamPersistence, type RejectionWrite } from "./stream-persistence"
+import { appendRejection } from "./transcript-rejections"
 
 export const STREAM_WRITE_LIMITS = {
   delayMs: 100,
@@ -13,10 +12,10 @@ export const STREAM_WRITE_LIMITS = {
   batchBytes: 64 * 1024,
   batchEvents: 64,
 }
-const BUSY_WARNING_INTERVAL_MS = 60_000
 type Delta = Extract<UiEvent, { type: "message.delta" }>
 type Parts = Extract<UiEvent, { type: "message.parts" }>
 type StreamEvent = Delta | Parts
+type PendingEvent = StreamEvent | RejectionWrite
 type Projection = {
   message: Message
   writeParts: ReturnType<typeof createStreamPartWriter>
@@ -25,15 +24,11 @@ type Projection = {
   textDeltas: Map<number, Array<string>>
   textLengths: Map<number, number>
 }
-const getEventBytes = (event: StreamEvent): number =>
-  event.type === "message.delta" ? Buffer.byteLength(event.delta) : Buffer.byteLength(JSON.stringify(event.parts))
-
-const isBusyError = (error: unknown): boolean =>
-  typeof error === "object" &&
-  error !== null &&
-  "code" in error &&
-  typeof error.code === "string" &&
-  error.code.startsWith("SQLITE_BUSY")
+const getEventBytes = (event: PendingEvent): number => {
+  if (event.type === "message.delta") return Buffer.byteLength(event.delta)
+  if (event.type === "message.parts") return Buffer.byteLength(JSON.stringify(event.parts))
+  return 0
+}
 
 const isSnapshotCovered = (projection: Projection, seq: number | undefined): boolean =>
   seq !== undefined && seq >= projection.baseSeq && seq <= (projection.message.updatedSeq ?? 0)
@@ -80,34 +75,29 @@ export const createStreamWriter = ({
   runStage?: PerformanceStageRunner
   getNow?: () => number
 }) => {
-  let pending: StreamEvent[] = []
+  // Stream buffers mutate locally so provider chunks stay append-only and bounded.
+  let pending: PendingEvent[] = []
   let pendingBytes = 0
+  let inFlight: PendingEvent[] = []
+  let inFlightBytes = 0
   const projections = new Map<string, Projection>()
   const runBytes = new Map<string, number>()
   const lastByMessage = new Map<string, StreamEvent>()
   let timer: ReturnType<typeof setTimeout> | null = null
-  let checkpointAt = getNow()
-  let checkpointCursor = 0
   let flushing = false
   let stopped = false
-  let lastBusyWarningAt = Number.NEGATIVE_INFINITY
-  let batchesWritten = 0
-  const outside = new WeakSet<StreamEvent>()
-  let unsettled: Array<{ event: StreamEvent; raw: string | null; seq: number }> = []
-  const warnBufferedWrites = (msg: string): void => {
-    try {
-      kernel.log({ level: "warn", module: "store", msg, data: { events: pending.length, bytes: pendingBytes } })
-    } catch {
-      // Storage failure can also prevent writing diagnostics; retain the accepted batch.
-    }
-  }
-  const warnBusyRetry = (): void => {
-    const now = Date.now()
-    if (now - lastBusyWarningAt < BUSY_WARNING_INTERVAL_MS) return
-
-    lastBusyWarningAt = now
-    warnBufferedWrites("Stream database busy; retrying buffered writes")
-  }
+  const outside = new WeakSet<PendingEvent>()
+  const persistence = createStreamPersistence({
+    database,
+    publish: (event) => kernel.publish(event),
+    onError: () => {
+      try {
+        kernel.log({ level: "error", module: "store", msg: "Stream persistence unavailable; retrying buffered writes" })
+      } catch {
+        // A full disk can also prevent writing the diagnostic log.
+      }
+    },
+  })
   const keyOf = (threadId: string, messageId: string): string => JSON.stringify([threadId, messageId])
   const createProjection = (message: Message, baseSeq: number, lastEvent: string | null = null): Projection => ({
     message,
@@ -137,13 +127,6 @@ export const createStreamWriter = ({
     if (runStage) runStage("stream_text_materialization", materialize)
     else materialize()
   }
-  const getSnapshotSeq = (threadId: string, messageId: string): number | undefined =>
-    (
-      database.query("SELECT updated_seq FROM messages WHERE thread_id = ? AND id = ?").get(threadId, messageId) as {
-        updated_seq: number
-      } | null
-    )?.updated_seq
-
   const tailSeq = (threadId: string, messageId: string): number =>
     (
       database
@@ -164,6 +147,7 @@ export const createStreamWriter = ({
     lastByMessage.clear()
     pendingBytes = 0
     for (const event of pending) {
+      if (event.type === "stream.rejection") continue
       const key = keyOf(event.threadId, event.messageId)
       const bytes = getEventBytes(event)
       pendingBytes += bytes
@@ -172,41 +156,15 @@ export const createStreamWriter = ({
     }
   }
 
-  const settle = (): void => {
-    if (!unsettled.length || database.inTransaction) return
-    const lost = unsettled.filter(({ event, raw, seq }) => {
-      if (raw === null) {
-        // A temporarily stale generation/status may itself have rolled back.
-        const thread = getThread({ threadId: event.threadId })
-        const message = getMessage({ threadId: event.threadId, messageId: event.messageId })
-        return thread?.generation === event.generation && message?.status === "streaming"
-      }
-      const row = database
-        .query("SELECT event_json FROM transcript_entries WHERE thread_id = ? AND seq = ?")
-        .get(event.threadId, seq) as { event_json: string } | null
-      return row?.event_json !== raw
-    })
-    unsettled = []
-    if (!lost.length) return
-    // Only work accepted before the outer transaction belongs to the retry.
-    // Work created by that transaction must disappear with its rollback.
-    projections.clear()
-    for (const { event } of lost) {
-      const restored = structuredClone(event)
-      delete restored.updatedSeq
-      outside.add(restored)
-      pending.push(restored)
-    }
-    rebuildQueueState()
-  }
-
   const flush = (): void => {
     if (stopped || flushing) return
-    settle()
+    if (database.inTransaction) {
+      if (!timer) timer = setTimeout(flushLater, STREAM_WRITE_LIMITS.delayMs)
+      return
+    }
     if (timer) clearTimeout(timer)
     timer = null
     if (!pending.length) {
-      if (unsettled.length) timer = setTimeout(flushLater, STREAM_WRITE_LIMITS.delayMs)
       return
     }
     flushing = true
@@ -223,181 +181,55 @@ export const createStreamWriter = ({
     const batch = pending.slice(0, batchCount)
     pending = pending.slice(batchCount)
     rebuildQueueState()
-    const committed: StreamEvent[] = []
-    const outerTransaction = database.inTransaction
-    const awaitingCommit: typeof unsettled = []
-    const previousBusyTimeout = (database.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout
-    try {
-      const writeBatch = database.transaction(() => {
-        const rebased = new Map<string, Message>()
-        const checked = new Set<string>()
-        for (const event of batch) {
-          const key = keyOf(event.threadId, event.messageId)
-          if (checked.has(key)) continue
-          checked.add(key)
-          const cached = projections.get(key)
-          const headSeq = getSnapshotSeq(event.threadId, event.messageId)
-          if (
-            !cached ||
-            !isSnapshotCovered(cached, headSeq) ||
-            tailSeq(event.threadId, event.messageId) > (cached.message.updatedSeq ?? 0)
-          ) {
-            materializeTranscript(database)
-            const message = getMessage({ threadId: event.threadId, messageId: event.messageId })
-            if (message) rebased.set(key, message)
-          }
-        }
-        for (const event of batch) {
-          const outcome =
-            outerTransaction && outside.has(event)
-              ? { event: structuredClone(event), raw: null as string | null, seq: 0 }
-              : null
-          if (outcome) awaitingCommit.push(outcome)
-          const thread = getThread({ threadId: event.threadId })
-          const head = database
-            .query("SELECT status, run_id FROM messages WHERE thread_id = ? AND id = ?")
-            .get(event.threadId, event.messageId) as { status: string; run_id: string | null } | null
-          const run = head?.run_id
-            ? (database.query("SELECT status, thread_id FROM runs WHERE id = ?").get(head.run_id) as {
-                status: string
-                thread_id: string
-              } | null)
-            : null
-          if (
-            !thread ||
-            thread.generation !== event.generation ||
-            head?.status !== "streaming" ||
-            (run && !["queued", "starting", "running"].includes(run.status))
-          ) {
-            if (event.type === "message.delta") recordTranscriptRejection(kernel, event, "stale_generation")
-            projections.delete(keyOf(event.threadId, event.messageId))
-            continue
-          }
-          const seq = (thread.updatedSeq ?? 0) + 1
-          if (
-            database.query("SELECT 1 FROM transcript_entries WHERE thread_id = ? AND seq = ?").get(event.threadId, seq)
-          ) {
-            if (event.type === "message.delta") recordTranscriptRejection(kernel, event, "seq_conflict")
-            projections.delete(keyOf(event.threadId, event.messageId))
-            materializeTranscript(database)
-            const message = getMessage({ threadId: event.threadId, messageId: event.messageId })
-            if (message) rebased.set(keyOf(event.threadId, event.messageId), message)
-            continue
-          }
-          const rebasedMessage = rebased.get(keyOf(event.threadId, event.messageId))
-          if (rebasedMessage) {
-            if (event.type === "message.delta") {
-              const part = rebasedMessage.parts[event.partIndex]
-              if (
-                event.partIndex > rebasedMessage.parts.length ||
-                (part && part.type !== "text" && part.type !== "reasoning")
-              ) {
-                recordTranscriptRejection(kernel, event, "validation")
-                continue
-              }
-              const text = part && "text" in part ? part.text : ""
-              event.offset = text.length
-              rebasedMessage.parts[event.partIndex] = {
-                ...part,
-                type: event.partType ?? "text",
-                text: text + event.delta,
-              }
-            } else {
-              for (const { partIndex, part } of event.parts) rebasedMessage.parts[partIndex] = structuredClone(part)
-            }
-            rebasedMessage.text = rebasedMessage.parts
-              .flatMap((part) => (part.type === "text" ? [part.text] : []))
-              .join("")
-          }
-          event.updatedSeq = seq
-          database.query("UPDATE threads SET updated_seq = ? WHERE id = ?").run(seq, event.threadId)
-          const raw = JSON.stringify(event)
-          const entry = database
-            .query("INSERT INTO transcript_entries(thread_id, seq, generation, event_json, at) VALUES (?, ?, ?, ?, ?)")
-            .run(event.threadId, seq, event.generation ?? 1, raw, event.updatedAt ?? Date.now())
-          if (outcome) {
-            outcome.raw = raw
-            outcome.seq = seq
-          }
-          if (event.type === "message.parts")
-            database
-              .query("INSERT INTO transcript_part_entries(entry_id, thread_id, message_id) VALUES (?, ?, ?)")
-              .run(entry.lastInsertRowid, event.threadId, event.messageId)
-          if (event.type === "message.parts" && head.run_id && run?.thread_id === event.threadId) {
-            for (const { part } of event.parts) {
-              if (!("callId" in part)) continue
-              database
-                .query(`INSERT INTO tool_resolutions(run_id, call_id, thread_id, part_json, resolution, resolved_at)
-                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(run_id, call_id) DO UPDATE SET
-                part_json = excluded.part_json, resolution = excluded.resolution, resolved_at = excluded.resolved_at
-                WHERE tool_resolutions.part_json IS NOT excluded.part_json
-                  OR tool_resolutions.resolution IS NOT excluded.resolution
-                  OR tool_resolutions.resolved_at IS NOT excluded.resolved_at`)
-                .run(
-                  head.run_id,
-                  part.callId,
-                  event.threadId,
-                  JSON.stringify(part),
-                  resolutionOf(part),
-                  part.resolvedAt ?? null,
-                )
-            }
-          }
-          const key = keyOf(event.threadId, event.messageId)
-          if (rebasedMessage)
-            projections.set(key, createProjection(rebasedMessage, getSnapshotSeq(event.threadId, event.messageId) ?? 0))
-          const projection = projections.get(key)
-          if (projection) {
-            projection.message.updatedSeq = seq
-            projection.lastEvent = raw
-          }
-          committed.push(event)
-        }
-        if (runStage) runStage("transcript_journal_capture", captureTranscript, database)
-        else captureTranscript(database)
-        if (getNow() - checkpointAt >= STREAM_WRITE_LIMITS.checkpointMs) {
-          // One projection per interval bounds work across concurrent replies; the journal is already durable.
-          const current = Array.from(projections.values())
-          const projection = current[checkpointCursor % current.length]
-          if (projection) {
-            const target = { threadId: projection.message.threadId, messageId: projection.message.id }
-            const checkpoint = () => materializeTranscript(database, target)
-            if (runStage) runStage("transcript_projection_checkpoint", checkpoint)
-            else checkpoint()
-            materializeProjectionText(projection)
-            projection.baseSeq = projection.message.updatedSeq ?? projection.baseSeq
-            projection.lastEvent = null
-          }
-          checkpointCursor += 1
-          checkpointAt = getNow()
-        }
-      })
-      database.exec("PRAGMA busy_timeout = 0")
-      try {
-        if (runStage) runStage("stream_journal_write", writeBatch)
-        else writeBatch()
-      } finally {
-        database.exec(`PRAGMA busy_timeout = ${previousBusyTimeout}`)
-      }
-      unsettled.push(...awaitingCommit)
-      batchesWritten++
-      // Publication sees only committed journal entries (or waits for an outer transaction).
-      for (const event of committed) kernel.publish(event)
-    } catch (error) {
-      // A failed transaction can leave an in-memory rebase only partly applied.
-      // Retry the complete batch against durable state, including all offsets.
-      for (const event of batch) projections.delete(keyOf(event.threadId, event.messageId))
-      pending = [...batch, ...pending]
-      rebuildQueueState()
-      if (isBusyError(error)) {
-        warnBusyRetry()
-        return
-      }
-      throw error
-    } finally {
+    const eligible = batch.filter((event) => outside.has(event))
+    if (!eligible.length) {
       flushing = false
-      if ((pending.length || unsettled.length) && !timer) timer = setTimeout(flushLater, STREAM_WRITE_LIMITS.delayMs)
+      if (pending.length && !timer) timer = setTimeout(flushLater, STREAM_WRITE_LIMITS.delayMs)
+      return
     }
+    if (eligible.length !== batch.length) {
+      for (const event of batch) projections.delete(keyOf(event.threadId, event.messageId))
+    }
+    const startedAt = performance.now()
+    inFlight = eligible
+    inFlightBytes = eligible.reduce((total, event) => total + getEventBytes(event), 0)
+    void persistence
+      .submit(eligible)
+      .then(({ events, rejected }) => {
+        inFlight = []
+        inFlightBytes = 0
+        const durationMs = performance.now() - startedAt
+        if (durationMs > STREAM_WRITE_LIMITS.delayMs) {
+          try {
+            kernel.log({
+              level: "debug",
+              module: "store",
+              msg: "Stream persistence batch committed",
+              data: { events: events.length, durationMs: Math.round(durationMs) },
+            })
+          } catch {
+            // Storage timing must not affect publication or retries.
+          }
+        }
+        for (const event of events) {
+          const projection = projections.get(keyOf(event.threadId, event.messageId))
+          if (!projection) continue
+          if (event.updatedSeq !== undefined) projection.message.updatedSeq = event.updatedSeq
+          projection.lastEvent = JSON.stringify(event)
+        }
+        for (const event of rejected) projections.delete(keyOf(event.rejection.threadId, event.rejection.messageId))
+      })
+      .catch(() => {
+        inFlight = []
+        inFlightBytes = 0
+        for (const event of eligible) projections.delete(keyOf(event.threadId, event.messageId))
+        pending = [...eligible, ...pending]
+        rebuildQueueState()
+      })
+      .finally(() => {
+        flushing = false
+        if (!stopped && pending.length && !timer) timer = setTimeout(flushLater, STREAM_WRITE_LIMITS.delayMs)
+      })
   }
 
   let retrying = false
@@ -442,38 +274,17 @@ export const createStreamWriter = ({
       )
         return cached
       flush()
-      // Another writer or recovery may have advanced the projection.
-      materializeTranscript(database)
+      projections.delete(key)
     }
-    // An outer transaction may have rolled back a snapshot after draining the
-    // writer. Recover its already committed tail before choosing new offsets.
-    let message = getMessage({ threadId, messageId })
+    const message = getMessage({ threadId, messageId })
     if (!message) return null
-    if (
-      !cached &&
-      database
-        .query(`
-      SELECT 1 FROM transcript_entries INDEXED BY transcript_delta_message
-        WHERE thread_id = ? AND json_extract(event_json, '$.messageId') = ? AND seq > ?
-          AND json_extract(event_json, '$.type') = 'message.delta'
-      UNION ALL
-      SELECT 1 FROM transcript_part_entries p JOIN transcript_entries e ON e.id = p.entry_id
-        WHERE p.thread_id = ? AND p.message_id = ? AND e.seq > ? LIMIT 1
-    `)
-        .get(threadId, messageId, message.updatedSeq ?? 0, threadId, messageId, message.updatedSeq ?? 0)
-    ) {
-      materializeTranscript(database)
-      message = getMessage({ threadId, messageId })
-      if (!message) return null
-    }
     const next = createProjection(message, message.updatedSeq ?? 0)
     projections.set(key, next)
     return next
   }
 
   const beforeAppend = (): void => {
-    settle()
-    // Keep preaccepted work distinct from work owned by an outer transaction.
+    // A surrounding SQLite transaction cannot be shared with the worker.
     if (pending.length && (database.inTransaction || !projections.size)) flush()
   }
 
@@ -512,14 +323,28 @@ export const createStreamWriter = ({
     else if (!timer) timer = setTimeout(flushLater, STREAM_WRITE_LIMITS.delayMs)
   }
 
+  const queueRejection = (event: RejectionWrite): void => {
+    if (!database.inTransaction) outside.add(event)
+    pending.push(event)
+    pendingBytes += getEventBytes(event)
+    flush()
+  }
+
   const appendDelta: StoreApi["appendDelta"] = (input) => {
     beforeAppend()
     // Explicit optimistic-concurrency writes retain their immediate sequence semantics.
     if (input.expectedSeq !== undefined) flush()
     const thread = getThread({ threadId: input.threadId })
-    const reject = (reason: Parameters<typeof recordTranscriptRejection>[2]): void => {
-      flush()
-      recordTranscriptRejection(kernel, input, reason)
+    const reject = (reason: RejectionWrite["reason"]): void => {
+      queueRejection({
+        type: "stream.rejection",
+        threadId: input.threadId,
+        messageId: input.messageId,
+        partIndex: input.partIndex,
+        ...(input.generation === undefined ? {} : { generation: input.generation }),
+        ...(input.expectedSeq === undefined ? {} : { expectedSeq: input.expectedSeq }),
+        reason,
+      })
     }
     const invalid = appendRejection(input, thread)
     if (invalid) return reject(invalid)
@@ -559,7 +384,7 @@ export const createStreamWriter = ({
           offset,
           partType: type,
           generation: thread.generation ?? 1,
-          updatedAt: Date.now(),
+          updatedAt: getNow(),
         },
         Buffer.byteLength(delta),
       )
@@ -644,7 +469,7 @@ export const createStreamWriter = ({
         messageId: input.messageId,
         parts,
         generation: thread.generation ?? 1,
-        updatedAt: Date.now(),
+        updatedAt: getNow(),
       },
       bytes,
     )
@@ -653,21 +478,44 @@ export const createStreamWriter = ({
   }
 
   const drain = ({ stopping = false }: { stopping?: boolean } = {}): void => {
-    if (stopped || flushing) return
-    settle()
-    // Subscribers can enqueue group mirrors during publication. Lifecycle/read
-    // boundaries must include that work before closing or taking a snapshot.
-    while (pending.length) {
-      const previousBatches = batchesWritten
-      flush()
-      if (batchesWritten === previousBatches) break
+    if (stopped) return
+    if (timer) clearTimeout(timer)
+    timer = null
+    flush()
+    if (!stopping) return
+
+    stopped = true
+    void persistence.close()
+  }
+
+  const drainAsync = async ({ stopping = false }: { stopping?: boolean } = {}): Promise<void> => {
+    if (timer) clearTimeout(timer)
+    timer = null
+    const deadline = stopping ? Date.now() + 2_000 : Number.POSITIVE_INFINITY
+    while ((pending.length || flushing) && Date.now() < deadline) {
+      if (!flushing) flush()
+      const drained = await persistence.drain({ timeoutMs: Math.max(1, deadline - Date.now()) })
+      if (drained && !pending.length && !flushing) break
+      await new Promise((resolve) => setTimeout(resolve, 20))
     }
     if (!stopping) return
 
     stopped = true
     if (timer) clearTimeout(timer)
     timer = null
-    if (pending.length) warnBufferedWrites("Shutdown could not persist buffered stream writes; database remains busy")
+    if (pending.length || flushing) {
+      try {
+        kernel.log({
+          level: "warn",
+          module: "store",
+          msg: "Shutdown could not persist buffered stream writes; database remains busy",
+          data: { events: pending.length + inFlight.length, bytes: pendingBytes + inFlightBytes },
+        })
+      } catch {
+        // A full disk can also prevent writing the diagnostic log.
+      }
+    }
+    await persistence.close()
   }
 
   return {
@@ -675,18 +523,25 @@ export const createStreamWriter = ({
     appendParts,
     flush,
     drain,
+    drainAsync,
+    closeIfIdle: (): boolean => {
+      if (pending.length || flushing) return false
+      if (!persistence.closeIfIdle()) return false
+      stopped = true
+      if (timer) clearTimeout(timer)
+      timer = null
+      return true
+    },
+    ready: persistence.ready,
+    getProjectedMessage: (threadId: string, messageId: string): Message | null => {
+      const projection = projections.get(keyOf(threadId, messageId))
+      if (!projection) return null
+      materializeProjectionText(projection)
+      return structuredClone(projection.message)
+    },
     invalidate: (threadId: string, messageId: string): void => {
       projections.delete(keyOf(threadId, messageId))
     },
-    checkpoint: (): void => {
-      drain()
-      // A busy writer keeps its accepted batch for the timer retry; reads use the last committed snapshot.
-      if (pending.length) return
-      const materialize = (): void => materializeTranscript(database)
-      if (runStage) runStage("transcript_projection_checkpoint", materialize)
-      else materialize()
-      projections.clear()
-      checkpointAt = getNow()
-    },
+    checkpoint: (): void => flush(),
   }
 }

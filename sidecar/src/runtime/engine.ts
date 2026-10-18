@@ -468,9 +468,9 @@ export const createRuntimeEngine = ({
     return stored !== null && ["queued", "starting", "running"].includes(stored.status)
   }
 
-  const finishLiveRun = (run: Run, finish: () => void): void => {
+  const finishLiveRun = async (run: Run, finish: () => void): Promise<void> => {
     // Accepted streaming work survives even if the final transaction rolls back.
-    kernel.services.use("store.api")?.flushWrites?.()
+    await kernel.services.use("store.api")?.flushWritesAsync?.()
     const write = (): void => {
       if (!isLive(run)) return
 
@@ -588,8 +588,6 @@ export const createRuntimeEngine = ({
       })
       // The store can replace completed output with a durable attachment reference.
       for (const patch of parts) state.parts[patch.partIndex] = patch.part
-      // Consent must be durable and visible before the approved action can proceed.
-      if (parts.some(({ part }) => part.type === "approval")) store.flushWrites?.()
       state.dirtyParts.clear()
       return
     }
@@ -886,14 +884,14 @@ export const createRuntimeEngine = ({
       const approvalId = kernel.newId()
       state.parts.push({ ...event.part, approvalId, botId: run.botId, createdAt: event.part.createdAt ?? Date.now() })
       state.dirtyParts.add(state.parts.length - 1)
-      notices.approval({
+      const approvalNotice = {
         botId: run.botId,
         threadId: run.threadId,
         requestId: approvalId,
         request: event.part.request,
         detail: event.part.detail,
         scope: event.part.scope,
-      })
+      }
       if (!state.replyMessageId) {
         const thread = store.getThread({ threadId: run.threadId })
         const request = run.requestMessageId && thread ? getActivePathMessage({ store, run }) : null
@@ -905,6 +903,16 @@ export const createRuntimeEngine = ({
         provider: providers.get(run.id) ?? adapters[run.provider],
       })
       if (state.replyMessageId) publishMessage({ store, state, run, status: "streaming" })
+      void (async () => {
+        try {
+          await store.flushWritesAsync?.()
+        } catch {
+          pendingApprovals.delete(approvalId)
+          return
+        }
+        if (!pendingApprovals.has(approvalId) || controllers.get(run.id)?.signal.aborted) return
+        notices.approval(approvalNotice)
+      })()
       return
     }
     if (event.type === "usage") {
@@ -1468,7 +1476,7 @@ export const createRuntimeEngine = ({
           ? planContinuation({ run, reason: "permission_granted", lastActivityAt: Date.now() })
           : null
         state.continueAfterApproval = false
-        finishLiveRun(run, () => {
+        await finishLiveRun(run, () => {
           ensureReply({ run, state, store, parentId: run.requestMessageId ?? thread.activeLeafId ?? run.id })
           state.parts = tools.finish(run, state.parts, "unknown")
           const conclusion = turnConclusion({
@@ -1501,7 +1509,7 @@ export const createRuntimeEngine = ({
           }
         })
       } else {
-        failTurn({
+        await failTurn({
           run,
           state,
           store,
@@ -1514,7 +1522,7 @@ export const createRuntimeEngine = ({
         })
       }
     } else {
-      failTurn({
+      await failTurn({
         run,
         state,
         store,
@@ -1529,7 +1537,7 @@ export const createRuntimeEngine = ({
     void drain()
   }
 
-  const finalizeFailure = ({
+  const finalizeFailure = async ({
     run,
     state,
     store,
@@ -1545,9 +1553,9 @@ export const createRuntimeEngine = ({
     errorClass: RunErrorClass
     errorMessage: string
     continuing?: boolean
-  }): void => {
+  }): Promise<void> => {
     const errorClass = refineErrorClass(reportedErrorClass, errorMessage)
-    finishLiveRun(run, () => {
+    await finishLiveRun(run, () => {
       state.parts = tools.finish(
         run,
         state.parts,
@@ -1814,7 +1822,7 @@ export const createRuntimeEngine = ({
     pendingContinuations.set(run.id, { timer, run })
   }
 
-  const failTurn = ({
+  const failTurn = async ({
     run,
     state,
     store,
@@ -1828,12 +1836,12 @@ export const createRuntimeEngine = ({
     thread: Thread
     errorClass: RunErrorClass
     errorMessage: string
-  }): void => {
+  }): Promise<void> => {
     const errorClass = refineErrorClass(reportedErrorClass, errorMessage)
     const crashed =
       CRASH_ERROR_CLASSES.includes(errorClass) && state.turnStarted && !state.cancelRequested && isLive(run)
     const plan = crashed ? planContinuation({ run, reason: "provider_crash", lastActivityAt: Date.now() }) : null
-    finalizeFailure({ run, state, store, thread, errorClass, errorMessage, continuing: plan !== null })
+    await finalizeFailure({ run, state, store, thread, errorClass, errorMessage, continuing: plan !== null })
     if (plan) scheduleContinuation({ run, plan })
   }
 
@@ -2090,7 +2098,6 @@ export const createRuntimeEngine = ({
     pendingApprovals.delete(approvalId)
     const result = await pending.provider.answerApproval({ approvalId: pending.providerApprovalId, decision })
     if (!result.success) return result
-    notices.resolve({ requestId: approvalId, resolution })
     const state = getState(pending.runId)
     const approval = state.parts.find(
       (part): part is ApprovalPart => part.type === "approval" && part.approvalId === approvalId,
@@ -2102,13 +2109,17 @@ export const createRuntimeEngine = ({
     }
     const run = persistence.getRun(pending.runId)
     const store = run ? kernel.services.use("store.api") : null
-    if (run && store) publishMessage({ store, state, run, status: "streaming" })
+    if (run && store) {
+      publishMessage({ store, state, run, status: "streaming" })
+      await store.flushWritesAsync?.()
+    }
+    notices.resolve({ requestId: approvalId, resolution })
     return { success: true }
   }
 
   const approvalBridge = createApprovalBridge({
     kernel,
-    onCard: (ctx, part) => {
+    onCard: async (ctx, part) => {
       const store = kernel.services.use("store.api")
       const run = ctx.runId ? persistence.getRun(ctx.runId) : null
       if (!store || !run || run.botId !== ctx.botId || run.threadId !== ctx.threadId) return false
@@ -2124,6 +2135,7 @@ export const createRuntimeEngine = ({
       if (!thread) return false
       ensureReply({ run, state, store, parentId: run.requestMessageId ?? thread.activeLeafId ?? run.id })
       publishMessage({ store, state, run, status: "streaming" })
+      await store.flushWritesAsync?.()
       return true
     },
   })
@@ -2544,6 +2556,7 @@ export const createRuntimeEngine = ({
       }),
     )
   const recovered = new Set<Id>()
+  const startupRecoveries: Array<Promise<void>> = []
   for (const run of persistence.listActiveRuns()) {
     recovered.add(run.id)
     const store = kernel.services.use("store.api")
@@ -2568,7 +2581,7 @@ export const createRuntimeEngine = ({
         reason: "app_restart",
         lastActivityAt: Math.max(run.startedAt ?? run.queuedAt, reply?.updatedAt ?? 0),
       })
-      finalizeFailure({
+      const recovery = finalizeFailure({
         run,
         state,
         store,
@@ -2576,8 +2589,10 @@ export const createRuntimeEngine = ({
         errorClass: "app_restart",
         errorMessage: "touri restarted",
         continuing: plan !== null,
+      }).then(() => {
+        if (plan && !startContinuation({ run, plan })) abandonContinuation({ run, status: "canceled" })
       })
-      if (plan && !startContinuation({ run, plan })) abandonContinuation({ run, status: "canceled" })
+      startupRecoveries.push(recovery)
       continue
     }
     const finishedAt = Date.now()
@@ -2624,10 +2639,11 @@ export const createRuntimeEngine = ({
   // Recovery repairs persisted history once. Terminal transitions already settle
   // their own tools; repeating recovery per turn rescans every previous result.
   if (recoveryStore) tools.reconcile(recoveryStore)
-  queueMicrotask(() => void drain())
+  const ready = Promise.all([startupCleanup, ...startupRecoveries]).then(() => undefined)
+  queueMicrotask(() => void ready.then(() => drain()))
 
   return {
-    ready: startupCleanup,
+    ready,
     goals,
     enqueue,
     activeRun,

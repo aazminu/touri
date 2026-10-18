@@ -44,7 +44,6 @@ import { refreshMessageSearch } from "../kernel/message-search"
 import { externalizeMessageParts, OUTPUT_BLOB_ORIGIN, readOutputAttachment } from "../kernel/output-blobs"
 import type { PerformanceStageRunner } from "../kernel/performance"
 import { isProfileProvider, validProviderProfileName } from "../kernel/provider-profiles"
-import { materializeTranscript } from "../kernel/transcript-storage"
 import { getLocalNotificationPreferences } from "../notify/preferences"
 import { hostComputerSupported } from "../platform"
 import { getHostIdentity } from "../platform/host"
@@ -447,7 +446,6 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
   await refreshHostFolderAccess()
   installDoctor(kernel)
   const database = kernel.db as Database
-  materializeTranscript(database)
 
   const getBot = ({ botId }: { botId: string }): Bot | null => {
     const row = database.query("SELECT * FROM bots WHERE id = ? AND archived_at IS NULL").get(botId) as RawBot | null
@@ -482,6 +480,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     getThread,
     ...(runStage ? { runStage } : {}),
   })
+  await streamWriter.ready
   const flushDeltas = streamWriter.checkpoint
 
   const updateThreadRow = ({
@@ -607,6 +606,11 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     return { success: true, message: stored }
   }
 
+  const updateMessageAsync: NonNullable<StoreApi["updateMessageAsync"]> = async (input) => {
+    await streamWriter.drainAsync()
+    return updateMessage(input)
+  }
+
   const activePath: StoreApi["activePath"] = ({ threadId, leafId, limit, fromRoot = false }) => {
     flushDeltas()
     const thread = getThread({ threadId })
@@ -622,7 +626,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
       .slice()
       .reverse()
       .flatMap((messageId) => {
-        const message = getMessage({ threadId, messageId })
+        const message = streamWriter.getProjectedMessage(threadId, messageId) ?? getMessage({ threadId, messageId })
         return message ? [message] : []
       })
   }
@@ -634,7 +638,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     const ids = getPathIds(database, threadId, targetId, -1, messageId)
     if (ids.at(-1) !== messageId) return null
 
-    return getMessage({ threadId, messageId })
+    return streamWriter.getProjectedMessage(threadId, messageId) ?? getMessage({ threadId, messageId })
   }
 
   const setActiveLeaf: StoreApi["setActiveLeaf"] = ({ threadId, leafId }) => {
@@ -1219,7 +1223,10 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     appendDelta: streamWriter.appendDelta,
     appendParts: streamWriter.appendParts,
     flushWrites: streamWriter.drain,
+    flushWritesAsync: streamWriter.drainAsync,
+    closeStreamWriterIfIdle: streamWriter.closeIfIdle,
     updateMessage,
+    updateMessageAsync,
     activePath,
     setActiveLeaf,
     getBot,

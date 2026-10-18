@@ -25,7 +25,11 @@ type EventSocket = Pick<ServerWebSocket<unknown>, "readyState" | "sendText"> &
 export const createEventBus = (
   database?: Database,
   runStage?: PerformanceStageRunner,
-  { now = performance.now.bind(performance), schedule = scheduleDelivery }: DeliveryScheduling = {},
+  {
+    now = performance.now.bind(performance),
+    schedule = scheduleDelivery,
+    deferRecovery = false,
+  }: DeliveryScheduling = {},
 ) => {
   const measureStage = <Value, Input>(stage: PerformanceStage, action: (input: Input) => Value, input: Input): Value =>
     runStage ? runStage(stage, action, input) : action(input)
@@ -285,9 +289,9 @@ export const createEventBus = (
     }
     if (!scheduled) flush()
   }
-  captureTranscript()
-  if (database) {
-    materializeTranscript(database)
+  if (!deferRecovery) {
+    captureTranscript()
+    if (database) materializeTranscript(database)
   }
 
   return {
@@ -327,6 +331,7 @@ export const createEventBus = (
 type DeliveryScheduling = {
   now?: () => number
   schedule?: (action: () => void) => () => void
+  deferRecovery?: boolean
 }
 
 const scheduleDelivery = (action: () => void): (() => void) => {

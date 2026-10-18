@@ -26,7 +26,7 @@ export const deleteGroupRoute = (kernel: Kernel): RouteModule["routes"][number] 
     if (busy)
       return { status: 409, json: { errorCode: "GROUP_BUSY", error: "Pare os turnos antes de apagar o grupo." } }
 
-    kernel.services.use("store.api")?.flushWrites?.()
+    await kernel.services.use("store.api")?.flushWritesAsync?.()
     const replay = getGroupReplayRows(database, groupId)
     const attachments = getGroupAttachments(database, groupId, replay)
     removeGroupFiles(kernel, database, groupId)

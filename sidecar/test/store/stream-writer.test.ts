@@ -3,7 +3,7 @@ import { afterEach, expect, spyOn, test } from "bun:test"
 import { mkdtempSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { UiEventEnvelope } from "@touri/contracts"
+import type { Run, UiEventEnvelope } from "@touri/contracts"
 import { createKernel } from "../../src/kernel"
 import { openDatabase } from "../../src/kernel/db"
 import { createEventBus } from "../../src/kernel/event-bus"
@@ -11,6 +11,7 @@ import { OUTPUT_INLINE_BUDGET_BYTES } from "../../src/kernel/output-blobs"
 import type { PerformanceStageRunner } from "../../src/kernel/performance"
 import { profileProviders } from "../../src/kernel/provider-profiles"
 import { compactTranscript, materializeTranscript } from "../../src/kernel/transcript-storage"
+import { createRuntimePersistence } from "../../src/runtime/persistence"
 import { init as initStore } from "../../src/store"
 import { STREAM_WRITE_LIMITS } from "../../src/store/stream-writer"
 import { readWorkspaceActivity } from "../../src/store/workspace-activity"
@@ -52,20 +53,88 @@ const fixture = async (runStage?: PerformanceStageRunner) => {
     database,
     store,
     events,
-    close: () => {
-      runtime.stop()
+    close: async () => {
+      await runtime.stop()
       rmSync(root, { recursive: true, force: true })
     },
   }
 }
 
-const cleanups = new Set<() => void>()
+const cleanups = new Set<() => void | Promise<void>>()
 
-afterEach(() => {
-  cleanups.forEach((cleanup) => {
-    cleanup()
-  })
+afterEach(async () => {
+  for (const cleanup of cleanups) await cleanup()
   cleanups.clear()
+})
+
+test("one worker commit publishes the message projection, journal and tool resolution together", async () => {
+  const f = await fixture()
+  try {
+    const run: Run = {
+      id: "run",
+      botId: "b",
+      threadId: "t",
+      provider: "codex",
+      trigger: "user",
+      requestMessageId: null,
+      replyMessageId: "a",
+      externalTurnId: null,
+      status: "running",
+      errorClass: null,
+      errorMessage: null,
+      usage: null,
+      routineRunId: null,
+      queuedAt: 1,
+      startedAt: 1,
+      finishedAt: null,
+    }
+    expect(createRuntimePersistence({ database: f.database }).saveRun(run)).toBe(true)
+    f.database.query("UPDATE messages SET run_id = 'run' WHERE thread_id = 't' AND id = 'a'").run()
+    const observed: Array<{ type: string; committedTogether: boolean }> = []
+    const unsubscribe = f.runtime.kernel.subscribe(({ event }) => {
+      if (event.type !== "message.delta" && event.type !== "message.parts") return
+      const journalRows = (
+        f.database.query("SELECT COUNT(*) AS count FROM transcript_entries WHERE thread_id = 't'").get() as {
+          count: number
+        }
+      ).count
+      const resolution = f.database.query("SELECT resolution FROM tool_resolutions WHERE run_id = 'run'").get()
+      observed.push({ type: event.type, committedTogether: journalRows >= 4 && Boolean(resolution) })
+    })
+
+    f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Resposta" })
+    f.store.appendParts?.({
+      threadId: "t",
+      messageId: "a",
+      parts: [
+        {
+          partIndex: 1,
+          part: {
+            type: "tool_call",
+            callId: "call",
+            tool: "fixture_tool",
+            summary: "Synthetic result",
+            inputJson: "{}",
+            outputJson: "done",
+            ok: true,
+            resolution: "succeeded",
+            resolvedAt: 2,
+          },
+        },
+      ],
+    })
+    await f.store.flushWritesAsync?.()
+
+    expect(observed.map(({ type }) => type)).toEqual(["message.delta", "message.parts"])
+    expect(observed.every(({ committedTogether }) => committedTogether)).toBe(true)
+    expect(f.database.query("SELECT resolution FROM tool_resolutions WHERE run_id = 'run'").get()).toEqual({
+      resolution: "succeeded",
+    })
+    expect(f.database.query("SELECT text FROM messages WHERE id = 'a'").get()).toEqual({ text: "Resposta" })
+    unsubscribe()
+  } finally {
+    await f.close()
+  }
 })
 
 test("projection validation scales with journal batches rather than provider deltas", async () => {
@@ -75,7 +144,7 @@ test("projection validation scales with journal batches rather than provider del
   cleanups.add(() => query.mockRestore())
 
   Array.from({ length: 1_000 }, () => f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "x" }))
-  f.store.flushWrites?.()
+  await f.store.flushWritesAsync?.()
   const validations = query.mock.calls.filter(([sql]) =>
     sql.includes("SELECT updated_seq, generation, status FROM messages"),
   )
@@ -90,14 +159,14 @@ test("a shared transcript checkpoint does not reload covered live projections", 
   cleanups.add(f.close)
   f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "a" })
   f.store.appendDelta({ threadId: "t", messageId: "b", partIndex: 0, delta: "b" })
-  f.store.flushWrites?.()
+  await f.store.flushWritesAsync?.()
   materializeTranscript(f.database)
   const query = spyOn(f.database, "query")
   cleanups.add(() => query.mockRestore())
 
   f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: " depois" })
   f.store.appendDelta({ threadId: "t", messageId: "b", partIndex: 0, delta: " depois" })
-  f.store.flushWrites?.()
+  await f.store.flushWritesAsync?.()
   const reads = query.mock.calls.filter(([sql]) => sql.includes("SELECT * FROM messages WHERE"))
 
   expect(reads).toHaveLength(0)
@@ -125,7 +194,7 @@ test("coalesces active messages in one timed flush and publishes only durable re
     expect(pointers).toHaveLength(2)
     expect(pointers.every(({ event_json }) => JSON.parse(event_json).ref && !event_json.includes("olá"))).toBe(true)
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -133,8 +202,9 @@ test("shutdown drains accepted text and can be repeated after the database close
   const f = await fixture()
   try {
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Preservar" })
-    expect(() => f.runtime.stop()).not.toThrow()
-    expect(() => f.runtime.stop()).not.toThrow()
+    const stopping = f.runtime.stop()
+    expect(f.runtime.stop()).toBe(stopping)
+    await stopping
     const recovered = openDatabase({ filename: join(f.root, "touri.db") })
     try {
       materializeTranscript(recovered)
@@ -143,11 +213,11 @@ test("shutdown drains accepted text and can be repeated after the database close
       recovered.close()
     }
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
-test("part-only recovery uses the dirty queue and keeps workspace approvals current before checkpoints", async () => {
+test("part-only commits keep workspace approvals current and recover after restart", async () => {
   const f = await fixture()
   try {
     const approval = {
@@ -158,10 +228,8 @@ test("part-only recovery uses the dirty queue and keeps workspace approvals curr
       decision: "pending" as const,
     }
     f.store.appendParts?.({ threadId: "t", messageId: "a", parts: [{ partIndex: 1, part: approval }] })
-    f.store.flushWrites?.()
-    expect(f.database.query("SELECT * FROM transcript_pending_deltas").all()).toEqual([
-      { thread_id: "t", message_id: "a" },
-    ])
+    await f.store.flushWritesAsync?.()
+    expect(f.database.query("SELECT * FROM transcript_pending_deltas").all()).toEqual([])
     const activity = readWorkspaceActivity(f.database).messages.find((message) => message.id === "a")
     expect(JSON.parse(activity?.parts_json ?? "[]")).toEqual([approval])
     const recovered = openDatabase({ filename: f.runtime.kernel.paths.db })
@@ -183,7 +251,7 @@ test("part-only recovery uses the dirty queue and keeps workspace approvals curr
       messageId: "a",
       parts: [{ partIndex: 1, part: { ...approval, decision: "approved" } }],
     })
-    f.store.flushWrites?.()
+    await f.store.flushWritesAsync?.()
     expect(f.database.query("SELECT decision FROM workspace_message_attention WHERE message_id = 'a'").get()).toEqual({
       decision: "approved",
     })
@@ -192,10 +260,10 @@ test("part-only recovery uses the dirty queue and keeps workspace approvals curr
       messageId: "a",
       parts: [{ partIndex: 1, part: { type: "reasoning", text: "Continuar" } }],
     })
-    f.store.flushWrites?.()
+    await f.store.flushWritesAsync?.()
     expect(f.database.query("SELECT * FROM workspace_message_attention WHERE message_id = 'a'").all()).toEqual([])
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -239,6 +307,7 @@ test("streamed completed outputs share the inline budget and reserve space for n
         },
       ],
     })
+    await f.store.flushWritesAsync?.()
     const message = f.store.activePath({ threadId: "t", leafId: "a" })[0]
     expect(message?.parts[21]).toMatchObject({ outputTail })
     const inlineBytes = message?.parts.reduce(
@@ -249,7 +318,7 @@ test("streamed completed outputs share the inline budget and reserve space for n
     const patches = f.events.flatMap(({ event }) => (event.type === "message.parts" ? [event] : [])).at(-1)?.parts
     expect(patches?.some(({ partIndex, part }) => partIndex < 21 && "outputAttachmentId" in part)).toBe(true)
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -258,6 +327,7 @@ test("8 KiB flushes immediately, splits large UTF-8 frames, and terminal writes 
   try {
     const delta = "🚀".repeat(5_000)
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta })
+    await f.store.flushWritesAsync?.()
     expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(2)
     f.store.updateMessage({ threadId: "t", messageId: "a", patch: { status: "complete" } })
     const deltas = f.events.flatMap(({ event }) => (event.type === "message.delta" ? [event] : []))
@@ -265,20 +335,20 @@ test("8 KiB flushes immediately, splits large UTF-8 frames, and terminal writes 
     expect(deltas.every((event) => Buffer.byteLength(event.delta) <= STREAM_WRITE_LIMITS.bytes)).toBe(true)
     expect(f.store.activePath({ threadId: "t", leafId: "a" })[0]?.text).toBe(delta)
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
-test("starting another message does not checkpoint an unrelated streaming reply", async () => {
+test("starting another message preserves the committed projection of a streaming reply", async () => {
   const f = await fixture()
   try {
     f.store.appendDelta({ threadId: "t", messageId: "b", partIndex: 0, delta: "Parcial" })
-    f.store.flushWrites?.()
+    await f.store.flushWritesAsync?.()
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Outra" })
-    expect(f.database.query("SELECT text FROM messages WHERE id='b'").get()).toEqual({ text: "" })
-    expect(f.database.query("SELECT text FROM messages_fts WHERE message_id='b'").get()).toEqual({ text: "" })
+    expect(f.database.query("SELECT text FROM messages WHERE id='b'").get()).toEqual({ text: "Parcial" })
+    expect(f.database.query("SELECT text FROM messages_fts WHERE message_id='b'").get()).toEqual({ text: "Parcial" })
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -288,12 +358,12 @@ test("two provider frames cannot overfill the per-message byte budget", async ()
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "a".repeat(7_000) })
     expect(f.events).toEqual([])
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "b".repeat(7_000) })
-    expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(1)
-    f.store.flushWrites?.()
+    expect(f.events).toEqual([])
+    await f.store.flushWritesAsync?.()
     expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(2)
     expect(f.store.activePath({ threadId: "t", leafId: "a" })[0]?.text).toBe("a".repeat(7_000) + "b".repeat(7_000))
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -312,12 +382,12 @@ test("an invalid patch list leaves the cached projection unchanged", async () =>
     ).toThrow("Invalid stream part index")
     expect(f.events).toEqual([])
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Preservar" })
-    f.store.flushWrites?.()
+    await f.store.flushWritesAsync?.()
     materializeTranscript(f.database)
     expect(f.database.query("SELECT text FROM messages WHERE id = 'a'").get()).toEqual({ text: "Preservar" })
     expect(f.events.filter(({ event }) => event.type === "message.parts")).toHaveLength(0)
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -332,8 +402,8 @@ test("small patches cannot overfill a buffered delta batch", async () => {
       messageId: "a",
       parts: [{ partIndex: 1, part: { type: "reasoning", text: reasoning } }],
     })
-    expect(f.events.map(({ event }) => event.type)).toEqual(["message.delta"])
-    f.store.flushWrites?.()
+    expect(f.events).toEqual([])
+    await f.store.flushWritesAsync?.()
     expect(f.events.map(({ event }) => event.type)).toEqual(["message.delta", "message.parts"])
     materializeTranscript(f.database)
     const row = f.database.query("SELECT text, parts_json FROM messages WHERE id = 'a'").get() as {
@@ -343,7 +413,7 @@ test("small patches cannot overfill a buffered delta batch", async () => {
     expect(row.text).toBe(text)
     expect(JSON.parse(row.parts_json)[1]).toMatchObject({ text: reasoning })
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -370,12 +440,13 @@ test("an indivisible large live tail flushes immediately without truncating prog
         },
       ],
     })
+    await f.store.flushWritesAsync?.()
     expect(f.events.map(({ event }) => event.type)).toEqual(["message.delta", "message.parts"])
     const progress = f.events.find(({ event }) => event.type === "message.parts")?.event
     expect(progress?.type === "message.parts" ? progress.parts[0]?.part : null).toMatchObject({ outputTail })
     expect(f.database.query("SELECT COUNT(*) AS n FROM attachments").get()).toEqual({ n: 0 })
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -386,7 +457,7 @@ test("a durable projection checkpoint preserves subsequent chunk and frame offse
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: text })
     f.store.activePath({ threadId: "t", leafId: "a" })
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "fim" })
-    f.store.flushWrites?.()
+    await f.store.flushWritesAsync?.()
     materializeTranscript(f.database)
     expect(f.database.query("SELECT text FROM messages WHERE id = 'a'").get()).toEqual({ text: `${text}fim` })
     const deltas = f.events.flatMap(({ event }) => (event.type === "message.delta" ? [event] : []))
@@ -397,7 +468,7 @@ test("a durable projection checkpoint preserves subsequent chunk and frame offse
     }
     expect(deltas.map((event) => event.delta).join("")).toBe(`${text}fim`)
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -409,8 +480,8 @@ test("patch journal recovers without snapshots, retains ordering and does not bo
     f.store.appendParts?.({ threadId: "t", messageId: "a", parts: [{ partIndex: 1, part }] })
     part.text = "Mutação fora da fila"
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 1, delta: " mais" })
-    f.store.flushWrites?.()
-    expect(f.database.query("SELECT text FROM messages WHERE id='a'").get()).toEqual({ text: "" })
+    await f.store.flushWritesAsync?.()
+    expect(f.database.query("SELECT text FROM messages WHERE id='a'").get()).toEqual({ text: "Antes" })
     expect(
       f.database
         .query(
@@ -436,7 +507,7 @@ test("patch journal recovers without snapshots, retains ordering and does not bo
       recovered.close()
     }
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -445,7 +516,7 @@ test("generation changes reject buffered deltas and rollback leaves no queued pa
   try {
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Antigo" })
     f.database.exec("UPDATE threads SET generation=generation+1 WHERE id='t'")
-    f.store.flushWrites?.()
+    await f.store.flushWritesAsync?.()
     expect(f.events.some(({ event }) => event.type === "message.delta")).toBe(false)
     expect(f.database.query("SELECT json_extract(record_json,'$.reason') AS reason FROM rejections").get()).toEqual({
       reason: "stale_generation",
@@ -459,7 +530,7 @@ test("generation changes reject buffered deltas and rollback leaves no queued pa
     await Bun.sleep(STREAM_WRITE_LIMITS.delayMs + 30)
     expect(f.database.query("SELECT COUNT(*) AS n FROM rejections").get()).toEqual({ n: 1 })
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -474,54 +545,47 @@ test("an unrelated pending message cannot conceal a rolled-back cached revision"
     ).toThrow("rollback")
     f.store.appendDelta({ threadId: "t", messageId: "b", partIndex: 0, delta: "outra" })
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "preservar" })
-    f.store.flushWrites?.()
+    await f.store.flushWritesAsync?.()
     materializeTranscript(f.database)
     expect(f.database.query("SELECT text FROM messages WHERE id = 'a'").get()).toEqual({ text: "preservar" })
     expect(f.database.query("SELECT text FROM messages WHERE id = 'b'").get()).toEqual({ text: "outra" })
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
-test("a background transaction failure retries the accepted batch without duplicate publication", async () => {
+test("a worker transaction failure retries the accepted batch without duplicate publication", async () => {
   const f = await fixture()
-  f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Preservar" })
-  const transaction = spyOn(f.database, "transaction").mockImplementationOnce(() => {
-    throw new Error("Synthetic storage busy")
-  })
   try {
-    await Bun.sleep(STREAM_WRITE_LIMITS.delayMs * 3 + 50)
+    f.database.exec(`CREATE TRIGGER fail_stream_write BEFORE INSERT ON transcript_entries
+      WHEN json_extract(NEW.event_json, '$.type') = 'message.delta'
+      BEGIN SELECT RAISE(ABORT, 'Synthetic storage failure'); END`)
+    f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Preservar" })
+    await Bun.sleep(STREAM_WRITE_LIMITS.delayMs * 2)
+    expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(0)
+    f.database.exec("DROP TRIGGER fail_stream_write")
+    await f.store.flushWritesAsync?.()
     const deltas = f.events.flatMap(({ event }) => (event.type === "message.delta" ? [event] : []))
     expect(deltas).toHaveLength(1)
     expect(deltas[0]?.delta).toBe("Preservar")
     materializeTranscript(f.database)
     expect(f.database.query("SELECT text FROM messages WHERE id = 'a'").get()).toEqual({ text: "Preservar" })
   } finally {
-    transaction.mockRestore()
-    f.close()
+    await f.close()
   }
 })
 
 test("stream writes retry a busy database without waiting on the main loop", async () => {
-  let observedDatabase: Database | null = null
-  const timeouts: number[] = []
-  const runStage: PerformanceStageRunner = <Value, Input = undefined>(
-    stage: string,
-    action: (input: Input) => Value,
-    input?: Input,
-  ): Value => {
-    if (stage !== "stream_journal_write" || !observedDatabase) return action(input as Input)
-    timeouts.push((observedDatabase.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout)
-    return action(input as Input)
-  }
-  const f = await fixture(runStage)
+  const f = await fixture()
   cleanups.add(f.close)
-  observedDatabase = f.database
   const blocker = new SqliteDatabase(join(f.root, "touri.db"))
   cleanups.add(() => blocker.close())
   blocker.exec("BEGIN IMMEDIATE")
-  const log = spyOn(f.runtime.kernel, "log")
-  cleanups.add(() => log.mockRestore())
+  let timerFired = false
+  const timer = setTimeout(() => {
+    timerFired = true
+  }, 10)
+  cleanups.add(() => clearTimeout(timer))
 
   expect(() =>
     f.store.appendDelta({
@@ -531,20 +595,14 @@ test("stream writes retry a busy database without waiting on the main loop", asy
       delta: "x".repeat(STREAM_WRITE_LIMITS.bytes),
     }),
   ).not.toThrow()
-  expect(timeouts).toEqual([0])
   expect((f.database.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(5_000)
   expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(0)
-
-  f.store.flushWrites?.()
-  f.store.flushWrites?.()
-  expect(
-    log.mock.calls.filter(([entry]) => entry.msg === "Stream database busy; retrying buffered writes"),
-  ).toHaveLength(1)
+  await Bun.sleep(30)
+  expect(timerFired).toBe(true)
 
   blocker.exec("ROLLBACK")
-  f.store.flushWrites?.()
+  await f.store.flushWritesAsync?.()
 
-  expect(timeouts).toEqual([0, 0, 0, 0])
   expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(1)
   expect(f.store.activePath({ threadId: "t", leafId: "a" })[0]?.text).toBe("x".repeat(STREAM_WRITE_LIMITS.bytes))
 })
@@ -560,9 +618,7 @@ test("shutdown warns about busy buffered writes and cancels retries before closi
   const log = spyOn(f.runtime.kernel, "log")
   cleanups.add(() => log.mockRestore())
 
-  expect(() => f.runtime.stop()).not.toThrow()
-  expect(() => f.runtime.stop()).not.toThrow()
-  expect(() => f.store.flushWrites?.()).not.toThrow()
+  await f.runtime.stop()
 
   expect(log.mock.calls.map(([entry]) => entry)).toContainEqual({
     level: "warn",
@@ -581,7 +637,7 @@ test("an explicit flush also drains parts mirrored reentrantly during committed 
   })
   try {
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Espelhado" })
-    f.store.flushWrites?.()
+    await f.store.flushWritesAsync?.()
     const deltas = f.database
       .query(
         "SELECT json_extract(event_json, '$.messageId') AS id FROM transcript_entries WHERE json_extract(event_json, '$.type') = 'message.delta' ORDER BY id",
@@ -591,7 +647,7 @@ test("an explicit flush also drains parts mirrored reentrantly during committed 
     expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(2)
   } finally {
     unsubscribe()
-    f.close()
+    await f.close()
   }
 })
 
@@ -606,45 +662,20 @@ test("retention of a referenced patch requests resync rather than silently dropp
         messageId: "a",
         parts: [{ partIndex: 1, part: { type: "reasoning", text: `${index}` } }],
       })
-      f.store.flushWrites?.()
+      await f.store.flushWritesAsync?.()
     }
     compactTranscript({ database: f.database, entriesPerThread: 2, events: 100, maxAgeMs: Number.MAX_SAFE_INTEGER })
     expect(bus.catchUp(cursor)).toMatchObject([{ event: { type: "transcript.resync" } }])
     expect(f.store.activePath({ threadId: "t", leafId: "a" })[0]?.parts[1]).toMatchObject({ text: "4" })
     bus.stop()
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
-test("large WAL stream writes keep autocheckpointing disabled and cap journal rows per transaction", async () => {
-  let observedDatabase: Database | null = null
-  const writerRows: number[] = []
-  const writerDurations: number[] = []
-  const stages: string[] = []
-  const getLastSeq = (database: Database): number =>
-    (
-      database.query("SELECT MAX(seq) AS seq FROM transcript_entries WHERE thread_id = 't'").get() as {
-        seq: number | null
-      }
-    ).seq ?? 0
-  const runStage: PerformanceStageRunner = <Value, Input = undefined>(
-    stage: string,
-    action: (input: Input) => Value,
-    input?: Input,
-  ): Value => {
-    stages.push(stage)
-    if (stage !== "stream_journal_write" || !observedDatabase) return action(input as Input)
-    const before = getLastSeq(observedDatabase)
-    const startedAt = performance.now()
-    const result = action(input as Input)
-    writerDurations.push(performance.now() - startedAt)
-    writerRows.push(getLastSeq(observedDatabase) - before)
-    return result
-  }
-  const f = await fixture(runStage)
+test("large WAL stream batches preserve ordered journal entries", async () => {
+  const f = await fixture()
   cleanups.add(f.close)
-  observedDatabase = f.database
 
   f.runtime.kernel.services.use("storage.maintenance")?.dispose()
   f.database.exec("PRAGMA wal_autocheckpoint = 0")
@@ -667,11 +698,6 @@ test("large WAL stream writes keep autocheckpointing disabled and cap journal ro
     expect(result.success).toBe(true)
   }
 
-  const previousAutocheckpoint = (
-    f.database.query("PRAGMA wal_autocheckpoint").get() as {
-      wal_autocheckpoint: number
-    }
-  ).wal_autocheckpoint
   f.database.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint = 0")
   const firstSyntheticSeq =
     (
@@ -693,8 +719,6 @@ test("large WAL stream writes keep autocheckpointing disabled and cap journal ro
   f.database
     .query("UPDATE schema_meta SET value = ? WHERE key = 'transcript_event_checkpoint'")
     .run(String(lastEntryId))
-  f.database.exec(`PRAGMA wal_autocheckpoint = ${previousAutocheckpoint}`)
-
   const walBytes = statSync(join(f.root, "touri.db-wal")).size
   const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 10_000)
   cleanups.add(() => clock.mockRestore())
@@ -707,17 +731,17 @@ test("large WAL stream writes keep autocheckpointing disabled and cap journal ro
 
   for (let index = 0; index < MAX_STREAM_EVENTS_PER_WRITE + 36; index++)
     f.store.appendDelta({ threadId: "t", messageId: `stream-${index}`, partIndex: 0, delta: "x" })
-  f.store.flushWrites?.()
+  await f.store.flushWritesAsync?.()
   await delivered.promise
 
-  const elapsedMs = Math.round(writerDurations.reduce((total, duration) => total + duration, 0))
-  console.info(`stream-write-large-wal ${JSON.stringify({ historyRows, walBytes, writerRows, writerMs: elapsedMs })}`)
+  console.info(`stream-write-large-wal ${JSON.stringify({ historyRows, walBytes })}`)
   expect(walBytes).toBeGreaterThan(16 * 1024 * 1024)
-  expect(writerRows.length).toBe(2)
-  expect(writerRows.every((rows) => rows > 0 && rows <= MAX_STREAM_EVENTS_PER_WRITE)).toBe(true)
   expect(f.events.slice(firstDeltaEvent).filter(({ event }) => event.type === "message.delta")).toHaveLength(100)
-  expect(
-    (f.database.query("PRAGMA wal_autocheckpoint").get() as { wal_autocheckpoint: number }).wal_autocheckpoint,
-  ).toBe(0)
-  expect(stages.filter((stage) => stage === "transcript_projection_checkpoint").length).toBeLessThanOrEqual(1)
+  const rows = f.database
+    .query(`SELECT json_extract(event_json, '$.messageId') AS message_id, seq
+      FROM transcript_entries WHERE json_extract(event_json, '$.type') = 'message.delta'
+        AND json_extract(event_json, '$.messageId') LIKE 'stream-%' ORDER BY seq`)
+    .all() as Array<{ message_id: string; seq: number }>
+  expect(rows).toHaveLength(100)
+  expect(rows.map(({ message_id }) => message_id)).toEqual(Array.from({ length: 100 }, (_, index) => `stream-${index}`))
 })

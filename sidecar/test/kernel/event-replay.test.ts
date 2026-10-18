@@ -24,8 +24,8 @@ const fixture = async () => {
     runtime,
     db,
     store,
-    close: () => {
-      runtime.stop()
+    close: async () => {
+      await runtime.stop()
       rmSync(root, { recursive: true, force: true })
     },
   }
@@ -98,7 +98,7 @@ test("streaming rewrites keep both journals bounded and hydrate the complete cur
     expect(latest.entries[0].event.message.parts).toHaveLength(60)
     bus.stop()
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -109,7 +109,7 @@ test("a reconnect gets each message once, in its latest revision, with contiguou
     insertReply(f)
     streamCommands(f, 20, 200)
     f.store.appendDelta({ threadId: "t", messageId: "reply", partIndex: 20, delta: "Pronto" })
-    f.store.flushWrites?.()
+    await f.store.flushWritesAsync?.()
     const bus = createEventBus(f.db)
     const caughtUp = bus.catchUp(1)
     expect(caughtUp.map(({ seq }) => seq)).toEqual(bus.replay(1).map(({ seq }) => seq))
@@ -125,7 +125,7 @@ test("a reconnect gets each message once, in its latest revision, with contiguou
     expect(caughtUp.at(-1)?.event).toMatchObject({ type: "message.delta", delta: "Pronto" })
     bus.stop()
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -145,7 +145,7 @@ test("cold clients and oversized gaps get one resync frame instead of the whole 
     expect(bus.catchUp(1)).toEqual([{ seq: head(), at: expect.any(Number), event: { type: "transcript.resync" } }])
     bus.stop()
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -169,7 +169,7 @@ test("a gap with more events than the cap resyncs without reading the stored bod
     f.db.query = query
     bus.stop()
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -194,7 +194,7 @@ test("a reference whose sequence now holds another entry falls back to the curre
     expect(event).toMatchObject({ type: "message.created", message: { id: "reply", parts: [{}, {}] } })
     bus.stop()
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -211,7 +211,7 @@ test("capturing an unpublished transcript releases its reader before checkpointi
     expect(f.db.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toMatchObject({ busy: 0 })
     bus.stop()
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -252,6 +252,6 @@ test("a socket reconnecting behind a large backlog stays open and receives live 
     ])
   } finally {
     socket?.close()
-    f.close()
+    await f.close()
   }
 })

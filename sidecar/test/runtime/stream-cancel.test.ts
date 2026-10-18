@@ -36,13 +36,13 @@ test("mid-stream cancellation preserves buffered text in live sockets, reconnect
   })
   turn.onEvent({ type: "text_delta", itemId: "reply", delta: "Resposta " })
   turn.onEvent({ type: "text_delta", itemId: "reply", delta: "parcial preservada." })
-  fixture.store.flushWrites?.()
+  await fixture.store.flushWritesAsync?.()
   await new Promise<void>((resolve) => setImmediate(resolve))
   const before = getMessages(fixture.frames)
   const cursor = fixture.frames.at(-1)?.seq ?? 0
 
   fixture.engine.cancel(fixture.runId)
-  fixture.store.flushWrites?.()
+  await fixture.store.flushWritesAsync?.()
   await new Promise<void>((resolve) => setImmediate(resolve))
   const duringCancel = getMessages(fixture.frames)
   const reconnected = getSocket()
@@ -115,7 +115,7 @@ const getFixture = async () => {
   const root = await mkdtemp(join(tmpdir(), "touri-stream-cancel-"))
   const runtime = getOfflineRuntime(root)
   cleanups.add(async () => {
-    runtime.stop()
+    await runtime.stop()
     await rm(root, { recursive: true, force: true })
   })
   runtime.kernel.services.use("storage.maintenance")?.dispose()
