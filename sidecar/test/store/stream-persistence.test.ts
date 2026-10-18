@@ -72,7 +72,7 @@ const persistBatch = async ({ filename, batch }: { filename: string; batch: unkn
   try {
     await new Promise<void>((resolve, reject) => {
       let committed = false
-      let stopped = false
+      let terminating = false
       let startupRetries = 0
       worker.onmessage = ({
         data,
@@ -83,11 +83,8 @@ const persistBatch = async ({ filename, batch }: { filename: string; batch: unkn
         }
         if (data.type === "committed") {
           committed = true
-          worker.postMessage({ type: "stop" })
-          return
-        }
-        if (data.type === "stopped" && committed) {
-          stopped = true
+          terminating = true
+          worker.terminate()
           return
         }
         if (data.type === "startup-error" && data.busy && startupRetries < 5) {
@@ -102,9 +99,12 @@ const persistBatch = async ({ filename, batch }: { filename: string; batch: unkn
         )
       }
       worker.addEventListener("close", () => {
-        if (committed && stopped) resolve()
+        if (committed && terminating) resolve()
       })
-      worker.onerror = (): void => reject(new Error("Stream persistence worker failed: worker error"))
+      worker.onerror = (event): void => {
+        if (terminating) return
+        reject(new Error(`Stream persistence worker failed: ${event.message || "worker error"}`))
+      }
       worker.postMessage({ type: "start", filename })
     })
   } finally {
