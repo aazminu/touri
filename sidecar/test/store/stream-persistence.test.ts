@@ -18,6 +18,7 @@ test("a restarted worker replays a committed batch without duplicating its journ
   cleanups.add(() => rm(root, { recursive: true, force: true }))
   const filename = join(root, "touri.db")
   const database = openDatabase({ filename })
+  const databasePath = database.filename
   database
     .query(
       "INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at) VALUES ('bot','Synthetic','codex','.',1,1)",
@@ -48,10 +49,10 @@ test("a restarted worker replays a committed batch without duplicating its journ
     ],
   }
 
-  await persistBatch({ filename, batch })
-  await persistBatch({ filename, batch })
+  await persistBatch({ filename: databasePath, batch })
+  await persistBatch({ filename: databasePath, batch })
 
-  const recovered = new Database(filename, { readonly: true })
+  const recovered = new Database(databasePath, { readonly: true })
   cleanups.add(() => recovered.close())
   const journalRows = recovered
     .query("SELECT COUNT(*) AS count FROM transcript_entries WHERE json_extract(event_json,'$.type')='message.delta'")
