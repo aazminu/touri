@@ -72,6 +72,9 @@ export const instrumentMainConnection = <Connection extends Database>(
 
   return new Proxy(database, {
     get: (target, property) => {
+      // Keep explicit overrides visible to instrumentation consumers such as spies.
+      if (Object.hasOwn(target, property)) return Reflect.get(target, property, target) as unknown
+
       const value = Reflect.get(target, property, target) as unknown
       if (property === "query" || property === "prepare")
         return (sql: string, ...args: Array<unknown>) =>

@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite"
-import { afterEach, expect, mock, test } from "bun:test"
+import { afterEach, expect, mock, spyOn, test } from "bun:test"
 import type { Kernel } from "@touri/contracts"
 import { createPerformanceDiagnostics, createPerformanceStageTracker } from "../../src/kernel/performance"
 import { createSlowStatementTracker, instrumentMainConnection } from "../../src/kernel/sqlite-performance"
@@ -56,6 +56,16 @@ test("the main connection preserves Bun's cached statement identity", () => {
   const second = database.query("SELECT id FROM fixture")
 
   expect(second).toBe(first)
+})
+
+test("main connection query overrides remain observable", () => {
+  const log = mock<Kernel["log"]>()
+  const database = getDatabase({ log, now: () => 0 })
+  const query = spyOn(database, "query")
+
+  database.query("SELECT id FROM fixture").all()
+
+  expect(query).toHaveBeenCalledTimes(1)
 })
 
 test("slow statement totals appear in the event-loop lag report", () => {
