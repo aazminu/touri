@@ -190,6 +190,35 @@ const sha256 = (value: string | Uint8Array): string => createHash("sha256").upda
 
 const now = (): EpochMs => Date.now()
 
+const getTranscriptRetentionResync = ({
+  database,
+  threadId,
+  since,
+  floor,
+  lastSeq,
+}: {
+  database: Database
+  threadId: string
+  since: number
+  floor: number
+  lastSeq: number
+}): boolean => {
+  if (since >= floor) return false
+
+  const throughSeq = Math.min(floor, lastSeq)
+  const retained = database
+    .query("SELECT COUNT(*) AS count FROM transcript_entries WHERE thread_id = ? AND seq > ? AND seq <= ?")
+    .get(threadId, since, throughSeq) as { count: number }
+  if (retained.count < throughSeq - since) return true
+
+  return Boolean(
+    database
+      .query(`SELECT 1 FROM transcript_entries
+        WHERE thread_id = ? AND seq > ? AND seq <= ? AND json_extract(event_json, '$.ref') = 1 LIMIT 1`)
+      .get(threadId, since, throughSeq),
+  )
+}
+
 const asBot = (row: RawBot): Bot => ({
   id: row.id,
   name: row.name,
@@ -1440,7 +1469,13 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
           // revisions must not look like an empty, up-to-date transcript.
           const resync =
             historyThreadPending(database, thread.id) ||
-            since < (floor?.through_seq ?? 0) ||
+            getTranscriptRetentionResync({
+              database,
+              threadId: thread.id,
+              since,
+              floor: floor?.through_seq ?? 0,
+              lastSeq: thread.updatedSeq ?? 0,
+            }) ||
             since > (thread.updatedSeq ?? 0)
           const rows = database
             .query(

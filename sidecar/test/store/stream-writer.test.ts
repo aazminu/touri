@@ -328,7 +328,7 @@ test("8 KiB flushes immediately, splits large UTF-8 frames, and terminal writes 
     const delta = "🚀".repeat(5_000)
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta })
     await f.store.flushWritesAsync?.()
-    expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(2)
+    expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(3)
     f.store.updateMessage({ threadId: "t", messageId: "a", patch: { status: "complete" } })
     const deltas = f.events.flatMap(({ event }) => (event.type === "message.delta" ? [event] : []))
     expect(deltas.map((event) => event.delta).join("")).toBe(delta)

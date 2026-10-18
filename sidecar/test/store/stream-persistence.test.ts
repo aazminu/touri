@@ -70,18 +70,24 @@ const persistBatch = async ({ filename, batch }: { filename: string; batch: unkn
   const worker = new Worker(workerUrl, { smol: true, ref: false })
   try {
     await new Promise<void>((resolve, reject) => {
+      let committed = false
       worker.onmessage = ({ data }: MessageEvent<{ type?: string; batch?: unknown }>): void => {
         if (data.type === "ready") {
           worker.postMessage({ type: "batch", batch })
           return
         }
         if (data.type === "committed") {
+          committed = true
+          worker.postMessage({ type: "stop" })
+          return
+        }
+        if (data.type === "stopped" && committed) {
           resolve()
           return
         }
-        reject(new Error("Stream persistence worker failed"))
+        reject(new Error(`Stream persistence worker failed: ${data.type ?? "unknown message"}`))
       }
-      worker.onerror = (): void => reject(new Error("Stream persistence worker failed"))
+      worker.onerror = (): void => reject(new Error("Stream persistence worker failed: worker error"))
       worker.postMessage({ type: "start", filename })
     })
   } finally {

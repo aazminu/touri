@@ -109,6 +109,7 @@ test("rejected appends persist safe metadata and replay once with contiguous rev
     f.store.appendDelta({ ...input, expectedSeq: 1 })
     f.store.appendDelta({ ...input, delta: "🚀".repeat(MAX_TRANSCRIPT_DELTA_BYTES / 4 + 1) })
     f.store.appendDelta({ ...input, partIndex: 2 })
+    await f.store.flushWritesAsync?.()
     const records = f.db.query("SELECT seq, record_json FROM rejections ORDER BY seq").all() as {
       seq: number
       record_json: string
@@ -776,6 +777,7 @@ test("restart resolves open tools and commands without changing already complete
       },
     })
     engine = createRuntimeEngine({ kernel: f.runtime.kernel })
+    await engine.ready
     const reply = f.store.activePath({ threadId: "t" })[0]
     expect(reply?.status).toBe("failed")
     expect(reply?.text).toBe("Parcial")
