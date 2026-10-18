@@ -197,8 +197,8 @@ test.each(process.env.TOURI_MESSAGE_STRESS === "1" ? [1] : [1, 2, 3])(
 const getFixture = async (threadIds: ReadonlyArray<string>) => {
   const root = mkdtempSync(join(tmpdir(), "touri-message-performance-"))
   const runtime = getOfflineRuntime(root)
-  cleanups.add(() => {
-    runtime.stop()
+  cleanups.add(async () => {
+    await runtime.stop()
     rmSync(root, { recursive: true, force: true })
   })
   runtime.kernel.services.use("storage.maintenance")?.dispose()

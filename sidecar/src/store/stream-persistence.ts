@@ -3,6 +3,7 @@ import type { UiEvent } from "@touri/contracts"
 import { streamPersistenceWorkerSource } from "./stream-persistence-worker"
 
 type StreamEvent = Extract<UiEvent, { type: "message.delta" | "message.parts" }>
+type DeltaWrite = Extract<UiEvent, { type: "message.delta" }> & { expectedSeq?: number }
 export type RejectionWrite = {
   type: "stream.rejection"
   threadId: string
@@ -12,7 +13,7 @@ export type RejectionWrite = {
   expectedSeq?: number
   reason: "validation" | "oversize" | "stale_generation" | "seq_conflict"
 }
-type StreamWriteEvent = StreamEvent | RejectionWrite
+type StreamWriteEvent = DeltaWrite | Extract<UiEvent, { type: "message.parts" }> | RejectionWrite
 type CommittedBatch = {
   type: "committed"
   id: string
@@ -23,7 +24,7 @@ type CommittedBatch = {
 type WorkerMessage =
   | CommittedBatch
   | { type: "ready" | "stopped" }
-  | { type: "startup-error"; busy: boolean }
+  | { type: "startup-error"; busy: boolean; code?: string }
   | { type: "batch-error"; id: string; busy: boolean }
 type Batch = { id: string; events: StreamWriteEvent[] }
 type PendingBatch = {

@@ -249,6 +249,13 @@ const writeBatch = (batch) => {
       }
       continue;
     }
+    if (event.type === "message.delta" && event.expectedSeq !== undefined && event.expectedSeq !== thread.updated_seq) {
+      const rejection = recordRejection(event, "seq_conflict");
+      rejected.push(rejection);
+      published.push(rejection);
+      continue;
+    }
+    delete event.expectedSeq;
     const nextSeq = thread.updated_seq + 1;
     if (database.query("SELECT 1 FROM transcript_entries WHERE thread_id = ? AND seq = ?")
       .get(event.threadId, nextSeq)) {
@@ -352,7 +359,11 @@ self.onmessage = ({ data }) => {
       })();
       self.postMessage({ type: "ready" });
     } catch (error) {
-      self.postMessage({ type: "startup-error", busy: isBusy(error) });
+      self.postMessage({
+        type: "startup-error",
+        busy: isBusy(error),
+        code: typeof error?.code === "string" ? error.code : "UNKNOWN",
+      });
     }
     return;
   }

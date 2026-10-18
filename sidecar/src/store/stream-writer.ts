@@ -13,8 +13,9 @@ export const STREAM_WRITE_LIMITS = {
 }
 type Delta = Extract<UiEvent, { type: "message.delta" }>
 type Parts = Extract<UiEvent, { type: "message.parts" }>
-type StreamEvent = Delta | Parts
-type PendingEvent = StreamEvent | RejectionWrite
+type PendingDelta = Delta & { expectedSeq?: number }
+type PendingStreamEvent = PendingDelta | Parts
+type PendingEvent = PendingStreamEvent | RejectionWrite
 type Projection = {
   message: Message
   writeParts: ReturnType<typeof createStreamPartWriter>
@@ -81,7 +82,7 @@ export const createStreamWriter = ({
   let inFlightBytes = 0
   const projections = new Map<string, Projection>()
   const runBytes = new Map<string, number>()
-  const lastByMessage = new Map<string, StreamEvent>()
+  const lastByMessage = new Map<string, PendingStreamEvent>()
   let timer: ReturnType<typeof setTimeout> | null = null
   let flushing = false
   let stopped = false
@@ -287,7 +288,7 @@ export const createStreamWriter = ({
     if (pending.length && (database.inTransaction || !projections.size)) flush()
   }
 
-  const queue = (event: StreamEvent, bytes: number): void => {
+  const queue = (event: PendingStreamEvent, bytes: number): void => {
     if (!database.inTransaction) outside.add(event)
     const eventKey = keyOf(event.threadId, event.messageId)
     const last = lastByMessage.get(eventKey)
@@ -297,6 +298,7 @@ export const createStreamWriter = ({
       last.threadId === event.threadId &&
       last.messageId === event.messageId &&
       last.partIndex === event.partIndex &&
+      last.expectedSeq === event.expectedSeq &&
       outside.has(last) === outside.has(event) &&
       last.generation === event.generation &&
       (last.offset ?? 0) + last.delta.length === event.offset &&
@@ -358,7 +360,7 @@ export const createStreamWriter = ({
     const part = message.parts[input.partIndex]
     if (input.partIndex > message.parts.length || (part && part.type !== "text" && part.type !== "reasoning"))
       return reject("validation")
-    for (const delta of chunks(input.delta)) {
+    for (const [index, delta] of chunks(input.delta).entries()) {
       const buffered = runBytes.get(keyOf(input.threadId, input.messageId)) ?? 0
       if (buffered && buffered + Buffer.byteLength(delta) > STREAM_WRITE_LIMITS.bytes) flush()
       const projection = projectionFor(input.threadId, input.messageId)
@@ -384,6 +386,7 @@ export const createStreamWriter = ({
           partType: type,
           generation: thread.generation ?? 1,
           updatedAt: getNow(),
+          ...(index === 0 && input.expectedSeq !== undefined ? { expectedSeq: input.expectedSeq } : {}),
         },
         Buffer.byteLength(delta),
       )

@@ -18,7 +18,6 @@ export const appendRejection = (
     return "validation"
   if (Buffer.byteLength(input.delta, "utf8") > MAX_TRANSCRIPT_DELTA_BYTES) return "oversize"
   if (input.generation !== undefined && input.generation !== thread?.generation) return "stale_generation"
-  if (input.expectedSeq !== undefined && input.expectedSeq !== thread?.updatedSeq) return "seq_conflict"
   return null
 }
 
