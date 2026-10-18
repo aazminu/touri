@@ -1270,7 +1270,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
         method: "GET",
         path: "/workspace/activity",
         handler: async () => {
-          flushDeltas()
+          await streamWriter.drainAsync()
           const { messages, runs } = readWorkspaceActivity(database)
           return jsonResponse(200, { messages: messages.map(asMessage), runs })
         },
@@ -1426,7 +1426,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
               await cloud.request("GET", `/v1/threads/${encodeURIComponent(cloudThread.id)}/transcript${suffix}`),
             )
           }
-          flushDeltas()
+          await streamWriter.drainAsync()
           const thread = getThread({ threadId: params.id ?? "" })
           if (!thread) return errorResponse(404, "NOT_FOUND", "Conversa não encontrada")
           const since = Number(query.since ?? 0)
@@ -1480,7 +1480,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
               await cloud.request("GET", `/v1/threads/${encodeURIComponent(cloudThread.id)}/messages${suffix}`),
             )
           }
-          flushDeltas()
+          await streamWriter.drainAsync()
           const thread = getThread({ threadId: params.id ?? "" })
           if (!thread) return errorResponse(404, "NOT_FOUND", "Thread not found")
           const messages =
@@ -1519,6 +1519,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
         method: "GET",
         path: "/search",
         handler: async ({ query }) => {
+          await streamWriter.drainAsync()
           const hits =
             query.botId === undefined
               ? search({ q: query.q ?? "", limit: 50 })

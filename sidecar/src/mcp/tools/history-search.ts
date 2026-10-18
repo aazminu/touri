@@ -31,6 +31,7 @@ export const createHistorySearchHandler =
           error: "O histórico privado exige aprovação humana para uso no grupo.",
         }
     }
+    await store.flushWritesAsync?.()
     const results =
       threadId === undefined
         ? store.search({ q: input.query, botId: ctx.botId, limit: input.limit ?? 10 })
