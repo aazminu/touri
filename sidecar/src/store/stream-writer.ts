@@ -8,7 +8,6 @@ import { appendRejection } from "./transcript-rejections"
 export const STREAM_WRITE_LIMITS = {
   delayMs: 100,
   bytes: 8 * 1024,
-  checkpointMs: 5_000,
   batchBytes: 64 * 1024,
   batchEvents: 64,
 }

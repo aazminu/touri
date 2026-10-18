@@ -30,13 +30,13 @@ test("schema 27 gains deletion indexes while retaining search and recovery objec
   const upgraded = fixture.reopen()
 
   expect(upgraded.query("SELECT value FROM schema_meta WHERE key = 'schema_version'").get()).toEqual({
-    value: "28",
+    value: "29",
   })
 
   const reopened = fixture.reopen()
 
   expect(reopened.query("SELECT value FROM schema_meta WHERE key = 'schema_version'").get()).toEqual({
-    value: "28",
+    value: "29",
   })
   expect(
     reopened

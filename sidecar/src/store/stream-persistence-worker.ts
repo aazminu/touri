@@ -217,6 +217,15 @@ const writeBatch = (batch) => {
   const rejected = [];
   const published = [];
   const projections = new Map();
+  const targets = new Map();
+  for (const event of batch.events) {
+    if (event.type === "stream.rejection") continue;
+    targets.set(JSON.stringify([event.threadId, event.messageId]), {
+      threadId: event.threadId,
+      messageId: event.messageId,
+    });
+  }
+  for (const target of targets.values()) materialize(target);
   for (const event of batch.events) {
     if (event.type === "stream.rejection") {
       const rejection = recordRejection(event, event.reason);
@@ -316,7 +325,7 @@ const writeBatch = (batch) => {
     published.push(event);
   }
   capture();
-  materialize();
+  for (const target of targets.values()) materialize(target);
   const result = { type: "committed", id: batch.id, events: committed, rejected, published };
   database.query("UPDATE stream_writer_state SET batch_id = ?, result_json = ? WHERE id = 1")
     .run(batch.id, JSON.stringify(result));
