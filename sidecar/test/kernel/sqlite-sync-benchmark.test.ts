@@ -226,6 +226,8 @@ const runWorker = async () => {
     let batchStartedAt = 0;
     let batchExpectedAt = 0;
     let batchEventLoopLagMs = 0;
+    let batchLatencyMs = 0;
+    let batchSyncCalls = 0;
     let checkpointStartedAt = 0;
     let checkpointExpectedAt = 0;
     let checkpointEventLoopLagMs = 0;
@@ -245,9 +247,8 @@ const runWorker = async () => {
         return;
       }
       if (data.type === "committed") {
-        data.batchLatencyMs = Math.round(performance.now() - batchStartedAt);
-        data.batchEventLoopLagMs = Math.round(batchEventLoopLagMs);
-        data.batchSyncCalls = library.symbols.touri_stop_sync_recording();
+        batchLatencyMs = Math.round(performance.now() - batchStartedAt);
+        batchSyncCalls = library.symbols.touri_stop_sync_recording();
         library.symbols.touri_start_sync_recording();
         checkpointStartedAt = performance.now();
         checkpointExpectedAt = checkpointStartedAt + 5;
@@ -258,6 +259,9 @@ const runWorker = async () => {
         return;
       }
       if (data.type === "checkpointed") {
+        data.batchLatencyMs = batchLatencyMs;
+        data.batchEventLoopLagMs = Math.round(batchEventLoopLagMs);
+        data.batchSyncCalls = batchSyncCalls;
         data.checkpointLatencyMs = Math.round(performance.now() - checkpointStartedAt);
         data.checkpointEventLoopLagMs = Math.round(checkpointEventLoopLagMs);
         data.checkpointSyncCalls = library.symbols.touri_stop_sync_recording();
