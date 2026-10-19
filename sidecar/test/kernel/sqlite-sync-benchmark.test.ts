@@ -239,9 +239,11 @@ const after = await measure(async () => {
   const drained = store.flushWritesAsync();
   await locked.promise;
   const writeStartedAt = performance.now();
-  const mainWrite = writeDatabaseAsync(database, () => database.query(
-    "INSERT INTO settings(key,value_json,updated_at) VALUES ('synthetic.concurrent','true',1)",
-  ).run()).then(() => { mainWriteLatencyMs = Math.round(performance.now() - writeStartedAt); });
+  const mainWrite = writeDatabaseAsync(database, () => {
+    const text = database.query("SELECT text FROM messages WHERE role = 'assistant'").get().text;
+    database.query("INSERT INTO settings(key,value_json,updated_at) VALUES ('synthetic.concurrent',?,1)")
+      .run(JSON.stringify(text));
+  }).then(() => { mainWriteLatencyMs = Math.round(performance.now() - writeStartedAt); });
   const cancelStartedAt = performance.now();
   engine.cancel(queued.run.id);
   cancelLatencyMs = Math.round(performance.now() - cancelStartedAt);
@@ -337,7 +339,7 @@ test.skipIf(!canRunSyncBenchmark)(
     expect(measured.after.maxLagMs).toBeLessThan(50)
     expect(measured.after.cancelLatencyMs).toBeLessThan(50)
     expect(measured.after.mainWriteLatencyMs).toBeGreaterThan(100)
-    expect(measured.after.mainWrite).toBe("true")
+    expect(measured.after.mainWrite).toBe(JSON.stringify("x".repeat(32)))
     expect(measured.after.abortObserved).toBe(true)
     expect(measured.after.journalRows).toBe(1)
     expect(measured.after.text).toBe("x".repeat(32))

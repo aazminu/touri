@@ -221,7 +221,11 @@ export const createStreamWriter = ({
     inFlightBytes = eligible.reduce((total, event) => total + getEventBytes(event), 0)
     void persistence
       .submit(eligible)
-      .then(({ events, rejected }) => {
+      .then(({ events, rejected, quarantined }) => {
+        if (quarantined)
+          eligible.forEach((event) => {
+            failed.add(event)
+          })
         inFlight = []
         inFlightBytes = 0
         const durationMs = performance.now() - startedAt

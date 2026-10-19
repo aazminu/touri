@@ -630,7 +630,7 @@ test("shutdown warns about busy buffered writes and cancels retries before closi
   expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(0)
 })
 
-test("an explicit flush also drains parts mirrored reentrantly during committed event publication", async () => {
+test("a subsequent flush drains parts mirrored after the first flush watermark", async () => {
   const f = await fixture()
   const unsubscribe = f.runtime.kernel.subscribe(({ event }) => {
     if (event.type !== "message.delta" || event.messageId !== "a") return
@@ -638,6 +638,7 @@ test("an explicit flush also drains parts mirrored reentrantly during committed 
   })
   try {
     f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Espelhado" })
+    await f.store.flushWritesAsync?.()
     await f.store.flushWritesAsync?.()
     const deltas = f.database
       .query(
@@ -849,4 +850,18 @@ test("a stopped worker cannot grow writer buffers or projections past the byte l
   expect(f.store.activePath({ threadId: "t", leafId: "a" })[0]?.text.length).toBe(accepted * input.delta.length)
   blocker.exec("ROLLBACK")
   await f.store.flushWritesAsync?.()
+})
+
+test("quarantined writes fail their durability boundary before approval can continue", async () => {
+  const f = await fixture()
+  cleanups.add(f.close)
+  f.database.exec(`CREATE TRIGGER fail_stream BEFORE INSERT ON transcript_entries
+    WHEN json_extract(NEW.event_json,'$.type') = 'message.delta'
+    BEGIN SELECT RAISE(ABORT, 'Synthetic permanent failure'); END`)
+  f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "não confirmado" })
+
+  await expect(f.store.flushWritesAsync?.()).rejects.toThrow("Stream writes were rejected")
+
+  expect(f.events.some(({ event }) => event.type === "message.delta")).toBe(false)
+  expect(f.database.query("SELECT COUNT(*) AS n FROM rejections").get()).toEqual({ n: 1 })
 })

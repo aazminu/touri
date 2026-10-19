@@ -209,14 +209,14 @@ const eventProjection = (event, cache) => {
   return projection;
 };
 
-const getBatchResult = (id, entryIds) => {
+const getBatchResult = (id, entryIds, quarantined) => {
   const published = entryIds.map((entryId) => {
     const row = database.query("SELECT event_json FROM transcript_entries WHERE id = ?").get(entryId);
     if (!row) throw new Error("Stream batch journal entry is missing");
     return JSON.parse(row.event_json);
   });
   return {
-    type: "committed", id,
+    type: "committed", id, quarantined,
     events: published.filter((event) => event.type === "message.delta" || event.type === "message.parts"),
     rejected: published.filter((event) => event.type === "transcript.rejected"),
     published,
@@ -227,7 +227,7 @@ const writeBatch = (batch) => {
   const previous = database.query("SELECT batch_id, result_json FROM stream_writer_state WHERE id = 1").get();
   if (previous?.batch_id === batch.id) {
     const saved = JSON.parse(previous.result_json);
-    return getBatchResult(batch.id, saved.entryIds);
+    return getBatchResult(batch.id, saved.entryIds, batch.quarantine === true);
   }
   const firstEntryId = database.query("SELECT COALESCE(MAX(id), 0) AS id FROM transcript_entries").get().id;
   // Batch projections stay local and mutable so one transaction can rebase provider chunks in order.
@@ -362,7 +362,7 @@ const writeBatch = (batch) => {
   }
   capture();
   if (!batch.quarantine) for (const target of targets.values()) materialize(target);
-  const result = { type: "committed", id: batch.id, events: committed, rejected, published };
+  const result = { type: "committed", id: batch.id, events: committed, rejected, published, quarantined: batch.quarantine === true };
   database.query("UPDATE stream_writer_state SET batch_id = ?, result_json = ? WHERE id = 1")
     .run(batch.id, JSON.stringify({ entryIds: database.query(
       "SELECT id FROM transcript_entries WHERE id > ? ORDER BY id",

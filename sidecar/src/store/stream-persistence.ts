@@ -23,6 +23,7 @@ type CommittedBatch = {
   events: StreamEvent[]
   rejected: Array<Extract<UiEvent, { type: "transcript.rejected" }>>
   published: UiEvent[]
+  quarantined?: boolean
 }
 type WorkerMessage =
   | CommittedBatch
@@ -34,6 +35,7 @@ type PendingBatch = {
   batch: Batch
   bytes: number
   attempts: number
+  failures: number
   promise: Promise<CommittedBatch>
   resolve: (result: CommittedBatch) => void
   reject: (error: Error) => void
@@ -138,21 +140,23 @@ export const createStreamPersistence = ({
     resolveReady()
     sendResync()
   }
-  const retryHead = (): void => {
+  const retryHead = (busy = false): void => {
     const head = queue[0]
     if (!head) return
     running = false
     head.attempts += 1
-    if (head.attempts >= MAX_ATTEMPTS && head.batch.quarantine) {
+    if (!busy) head.failures += 1
+    if (head.failures >= MAX_ATTEMPTS && head.batch.quarantine) {
       removeHead()?.reject(new Error("Stream batch could not be quarantined"))
       sendResync()
       commitHead()
       return
     }
-    if (head.attempts >= MAX_ATTEMPTS) {
+    if (head.failures >= MAX_ATTEMPTS) {
       // A poison batch cannot monopolize other threads. Persist rejections instead of its payload.
       head.batch = { ...head.batch, quarantine: true }
       head.attempts = 0
+      head.failures = 0
       reportError()
     }
     scheduleRetry(Math.max(1, head.attempts), () => {
@@ -206,7 +210,7 @@ export const createStreamPersistence = ({
         if (data?.type === "batch-error") {
           if (queue[0]?.batch.id !== data.id) return
           if (!data.busy) reportError()
-          retryHead()
+          retryHead(data.busy)
           return
         }
         if (data?.type !== "committed") return
@@ -258,7 +262,15 @@ export const createStreamPersistence = ({
       resolveBatch = resolve
       rejectBatch = reject
     })
-    queue = queue.concat({ batch, bytes, attempts: 0, promise, resolve: resolveBatch, reject: rejectBatch })
+    queue = queue.concat({
+      batch,
+      bytes,
+      attempts: 0,
+      failures: 0,
+      promise,
+      resolve: resolveBatch,
+      reject: rejectBatch,
+    })
     queuedBytes += bytes
     queuedEvents += events.length
     commitHead()

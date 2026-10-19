@@ -14,7 +14,10 @@ afterEach(async () => {
   cleanups.clear()
 })
 
-const getFixture = async (createWorker?: (url: string) => Worker) => {
+const getFixture = async (
+  createWorker?: (url: string) => Worker,
+  prepare?: (database: ReturnType<typeof openDatabase>) => void,
+) => {
   const root = await mkdtemp(join(tmpdir(), "touri-stream-persistence-"))
   cleanups.add(() => rm(root, { recursive: true, force: true }))
   const database = openDatabase({ filename: join(root, "touri.db") })
@@ -30,6 +33,7 @@ const getFixture = async (createWorker?: (url: string) => Worker) => {
       VALUES ('reply',?,'assistant','text','streaming','','[{"type":"text","text":""}]',1,1)`)
       .run(threadId)
   })
+  prepare?.(database)
   const published: UiEvent[] = []
   const errors: number[] = []
   const persistence = createStreamPersistence({
@@ -163,15 +167,19 @@ test("a permanent batch error backs off, records a rejection and lets another th
 
 test("startup materialization failure has a finite retry budget and rejects buffered work with resync", async () => {
   let starts = 0
-  const f = await getFixture(() => {
-    starts += 1
-    return createSourceWorker(
-      streamPersistenceWorkerSource.replace(
-        "        materialize();",
-        '        throw new Error("Synthetic materialization failure");',
-      ),
-    )
-  })
+  const f = await getFixture(
+    () => {
+      starts += 1
+      return createSourceWorker(streamPersistenceWorkerSource)
+    },
+    (database) => {
+      const broken = { ...getDelta(), offset: 99, updatedSeq: 2 }
+      database
+        .query("INSERT INTO transcript_entries(thread_id,seq,generation,event_json,at) VALUES ('thread',2,1,?,2)")
+        .run(JSON.stringify(broken))
+      database.exec("UPDATE threads SET updated_seq = 2 WHERE id = 'thread'")
+    },
+  )
 
   await expect(f.persistence.submit([getDelta()])).rejects.toThrow("could not start")
   await f.persistence.ready
