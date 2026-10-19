@@ -21,13 +21,27 @@ const syncShim = `#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef int (*SyncFunction)(int);
 
 static atomic_int recording = 0;
 static atomic_int sync_count = 0;
 static atomic_int sync_delay_ms = 20;
+static atomic_int sqlite_only = 0;
+
+static int is_sqlite_file(int descriptor) {
+  char descriptor_path[64];
+  char path[4096];
+  snprintf(descriptor_path, sizeof(descriptor_path), "/proc/self/fd/%d", descriptor);
+  const ssize_t length = readlink(descriptor_path, path, sizeof(path) - 1);
+  if (length < 0) return 0;
+  path[length] = 0;
+  return strstr(path, ".db") != NULL;
+}
 
 static int delay_sync(const char *name, int descriptor) {
   SyncFunction original = (SyncFunction)dlsym(RTLD_NEXT, name);
@@ -35,7 +49,7 @@ static int delay_sync(const char *name, int descriptor) {
     errno = ENOSYS;
     return -1;
   }
-  if (atomic_load(&recording)) {
+  if (atomic_load(&recording) && (!atomic_load(&sqlite_only) || is_sqlite_file(descriptor))) {
     const int delay_ms = atomic_load(&sync_delay_ms);
     struct timespec delay = {delay_ms / 1000, (delay_ms % 1000) * 1000 * 1000};
     atomic_fetch_add(&sync_count, 1);
@@ -50,6 +64,11 @@ int fdatasync(int descriptor) { return delay_sync("fdatasync", descriptor); }
 int touri_start_sync_recording(void) {
   atomic_store(&sync_count, 0);
   atomic_store(&recording, 1);
+  return 0;
+}
+
+int touri_set_sqlite_only(int enabled) {
+  atomic_store(&sqlite_only, enabled);
   return 0;
 }
 
@@ -161,6 +180,7 @@ const library = dlopen(process.env.TOURI_SYNC_SHIM, {
   touri_start_sync_recording: { args: [], returns: "i32" },
   touri_stop_sync_recording: { args: [], returns: "i32" },
   touri_set_sync_delay_ms: { args: ["i32"], returns: "i32" },
+  touri_set_sqlite_only: { args: ["i32"], returns: "i32" },
 });
 const measure = async (operation) => {
   let maxLagMs = 0;
@@ -190,6 +210,7 @@ const before = await measure(() => beforeDatabase.transaction(() => {
 }).immediate());
 before.syncCalls = library.symbols.touri_stop_sync_recording();
 beforeDatabase.close();
+library.symbols.touri_set_sqlite_only(1);
 
 const directory = join(process.env.TOURI_BENCH_DIR, "production");
 const runtime = createKernel({ appData: directory });
@@ -200,7 +221,7 @@ const workerUrls = [];
 await init(runtime.kernel, undefined, () => {
   const source = streamPersistenceWorkerSource.replace(
     "database.transaction(() => writeBatch(data.batch)).immediate()",
-    'database.transaction(() => { self.postMessage({ type: "test-locked" }); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); return writeBatch(data.batch); }).immediate()',
+    'database.transaction(() => { if (data.batch.events.some((event) => event.delta === "x".repeat(32))) { self.postMessage({ type: "test-locked" }); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); } return writeBatch(data.batch); }).immediate()',
   );
   const url = URL.createObjectURL(new Blob([source], { type: "application/javascript" }));
   workerUrls.push(url);
@@ -231,6 +252,8 @@ const engine = createRuntimeEngine({ kernel: runtime.kernel, environment: { HOME
 const queued = engine.enqueue({ threadId: "thread", requestMessageId: "request", trigger: "user" });
 if (!queued.success) throw new Error("Could not start synthetic turn");
 const args = await turn.promise;
+args.onEvent({ type: "text_delta", itemId: "text", delta: "warm" });
+await store.flushWritesAsync();
 library.symbols.touri_start_sync_recording();
 let cancelLatencyMs = 0;
 let mainWriteLatencyMs = 0;
@@ -339,10 +362,10 @@ test.skipIf(!canRunSyncBenchmark)(
     expect(measured.after.maxLagMs).toBeLessThan(50)
     expect(measured.after.cancelLatencyMs).toBeLessThan(50)
     expect(measured.after.mainWriteLatencyMs).toBeGreaterThan(100)
-    expect(measured.after.mainWrite).toBe(JSON.stringify("x".repeat(32)))
+    expect(measured.after.mainWrite).toBe(JSON.stringify(`warm${"x".repeat(32)}`))
     expect(measured.after.abortObserved).toBe(true)
-    expect(measured.after.journalRows).toBe(1)
-    expect(measured.after.text).toBe("x".repeat(32))
+    expect(measured.after.journalRows).toBe(2)
+    expect(measured.after.text).toBe(`warm${"x".repeat(32)}`)
   },
   15_000,
 )

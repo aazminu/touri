@@ -831,6 +831,8 @@ test("a synchronous replacement also fences a batch already submitted to the wor
 test("a stopped worker cannot grow writer buffers or projections past the byte limit", async () => {
   const f = await fixture()
   cleanups.add(f.close)
+  const log = spyOn(f.runtime.kernel, "log")
+  cleanups.add(() => log.mockRestore())
   const blocker = new SqliteDatabase(join(f.root, "touri.db"))
   cleanups.add(() => blocker.close())
   blocker.exec("BEGIN IMMEDIATE")
@@ -848,6 +850,9 @@ test("a stopped worker cannot grow writer buffers or projections past the byte l
   expect(accepted).toBeGreaterThan(0)
   expect(accepted * Buffer.byteLength(input.delta)).toBeLessThanOrEqual(STREAM_WRITE_LIMITS.pendingBytes)
   expect(f.store.activePath({ threadId: "t", leafId: "a" })[0]?.text.length).toBe(accepted * input.delta.length)
+  expect(log.mock.calls.map(([entry]) => entry.msg)).toContain(
+    "Stream buffer limit reached; rejecting additional writes",
+  )
   blocker.exec("ROLLBACK")
   await f.store.flushWritesAsync?.()
 })

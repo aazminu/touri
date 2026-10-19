@@ -26,10 +26,11 @@ type Projection = {
   textDeltas: Map<number, Array<string>>
   textLengths: Map<number, number>
 }
-const getEventBytes = (event: PendingEvent): number => {
+const getEventBytes = (event: PendingEvent): number => Buffer.byteLength(JSON.stringify(event))
+const getPayloadBytes = (event: PendingEvent): number => {
   if (event.type === "message.delta") return Buffer.byteLength(event.delta)
   if (event.type === "message.parts") return Buffer.byteLength(JSON.stringify(event.parts))
-  return 256
+  return getEventBytes(event)
 }
 
 const isSnapshotCovered = (projection: Projection, seq: number | undefined): boolean =>
@@ -111,7 +112,7 @@ export const createStreamWriter = ({
   })
   const ensureCapacity = (bytes: number, events = 1): void => {
     const bufferedEvents = pending.length + inFlight.length + events
-    const bufferedBytes = pendingBytes + inFlightBytes + bytes + bufferedEvents * 512
+    const bufferedBytes = pendingBytes + inFlightBytes + bytes
     if (stopped) throw new Error("Stream writer is closed")
     if (bufferedBytes <= STREAM_WRITE_LIMITS.pendingBytes && bufferedEvents <= STREAM_WRITE_LIMITS.pendingEvents) return
     if (!capacityReported) {
@@ -176,7 +177,7 @@ export const createStreamWriter = ({
       pendingBytes += getEventBytes(event)
       if (event.type === "stream.rejection") continue
       const key = keyOf(event.threadId, event.messageId)
-      const bytes = getEventBytes(event)
+      const bytes = getPayloadBytes(event)
       runBytes.set(key, (runBytes.get(key) ?? 0) + bytes)
       lastByMessage.set(key, event)
     }
@@ -198,7 +199,7 @@ export const createStreamWriter = ({
     let batchCount = 0
     for (const event of pending) {
       if (batchCount >= STREAM_WRITE_LIMITS.batchEvents) break
-      const bytes = getEventBytes(event)
+      const bytes = getPayloadBytes(event)
       if (batchCount > 0 && batchBytes + bytes > STREAM_WRITE_LIMITS.batchBytes) break
       batchBytes += bytes
       batchCount++
@@ -329,6 +330,8 @@ export const createStreamWriter = ({
     if (!database.inTransaction) outside.add(event)
     const eventKey = keyOf(event.threadId, event.messageId)
     const last = lastByMessage.get(eventKey)
+    const previousBytes = last ? getEventBytes(last) : 0
+    let addedBytes = getEventBytes(event)
     if (
       event.type === "message.delta" &&
       last?.type === "message.delta" &&
@@ -343,6 +346,7 @@ export const createStreamWriter = ({
     ) {
       last.delta += event.delta
       last.updatedAt = event.updatedAt ?? Date.now()
+      addedBytes = getEventBytes(last) - previousBytes
     } else {
       pending.push(event)
       lastByMessage.set(eventKey, event)
@@ -350,7 +354,7 @@ export const createStreamWriter = ({
     const key = keyOf(event.threadId, event.messageId)
     const size = (runBytes.get(key) ?? 0) + bytes
     runBytes.set(key, size)
-    pendingBytes += bytes
+    pendingBytes += addedBytes
     if (
       size >= STREAM_WRITE_LIMITS.bytes ||
       pending.length >= STREAM_WRITE_LIMITS.batchEvents ||
@@ -399,7 +403,8 @@ export const createStreamWriter = ({
     if (input.partIndex > message.parts.length || (part && part.type !== "text" && part.type !== "reasoning"))
       return reject("validation")
     const deltas = chunks(input.delta)
-    ensureCapacity(Buffer.byteLength(input.delta), deltas.length)
+    const envelopeBytes = Buffer.byteLength(JSON.stringify({ ...input, delta: "" })) + 256
+    ensureCapacity(Buffer.byteLength(JSON.stringify(input.delta)) + deltas.length * envelopeBytes, deltas.length)
     for (const [index, delta] of deltas.entries()) {
       const buffered = runBytes.get(keyOf(input.threadId, input.messageId)) ?? 0
       if (buffered && buffered + Buffer.byteLength(delta) > STREAM_WRITE_LIMITS.bytes) flush()
@@ -458,7 +463,7 @@ export const createStreamWriter = ({
     // A later invalid patch must not change offsets in the cached projection or
     // externalize an earlier part. Prepare the whole event before applying it.
     validateIndices(current.message.parts.length)
-    ensureCapacity(Buffer.byteLength(JSON.stringify(input.parts)))
+    ensureCapacity(Buffer.byteLength(JSON.stringify(input)) + 256)
     const prepared = input.parts.map(({ partIndex, part }) => ({ partIndex, part: structuredClone(part) }))
     const changesText = prepared.some(
       ({ partIndex, part }) =>
@@ -496,7 +501,9 @@ export const createStreamWriter = ({
       if (current !== preparedProjection) parts = current.writeParts(prepared)
     }
     const bytes = current === preparedProjection ? patchBytes : Buffer.byteLength(JSON.stringify(parts))
-    ensureCapacity(bytes)
+    ensureCapacity(
+      Buffer.byteLength(JSON.stringify({ threadId: input.threadId, messageId: input.messageId, parts })) + 256,
+    )
     for (const [index, patch] of parts.entries()) {
       current.message.parts[patch.partIndex] = structuredClone(patch.part)
       current.textDeltas.delete(patch.partIndex)
@@ -560,7 +567,10 @@ export const createStreamWriter = ({
           level: "warn",
           module: "store",
           msg: "Shutdown could not persist buffered stream writes; database remains busy",
-          data: { events: pending.length + inFlight.length, bytes: pendingBytes + inFlightBytes },
+          data: {
+            events: pending.length + inFlight.length,
+            bytes: pending.concat(inFlight).reduce((total, event) => total + getPayloadBytes(event), 0),
+          },
         })
       } catch {
         // A full disk can also prevent writing the diagnostic log.
