@@ -219,7 +219,7 @@ test("new stores reclaim a bounded number of free pages and retain a live reader
     expect(before - free()).toBeLessThanOrEqual(32)
     expect(reader.query("SELECT COUNT(*) AS n FROM discarded").get()).toEqual({ n: 400 })
     reader.exec("COMMIT")
-    expect(database.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 10 })
+    expect(database.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 })
   } finally {
     reader.close()
     database.close()

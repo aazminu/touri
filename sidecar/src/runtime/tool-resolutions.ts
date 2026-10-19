@@ -33,10 +33,16 @@ const terminalReason = (status: Run["status"]): Exclude<ToolResolution, "running
 
 export const createToolResolutions = (kernel: Kernel) => {
   const database = kernel.db instanceof Database ? kernel.db : null
+  // Cancellation must fence late tool results before the worker has committed its disposition.
+  const pendingInterruptions = new Map<string, Map<string, ToolPart>>()
   const record = (run: Run, part: ToolPart, recovering = false, persist = true): ToolPart => {
-    const previous = database
+    const stored = database
       ?.query("SELECT resolution, resolved_at, part_json FROM tool_resolutions WHERE run_id = ? AND call_id = ?")
       .get(run.id, part.callId) as { resolution: ToolResolution; resolved_at: number | null; part_json: string } | null
+    const pending = pendingInterruptions.get(run.id)?.get(part.callId)
+    const previous = pending
+      ? { resolution: outcome(pending), resolved_at: pending.resolvedAt ?? null, part_json: JSON.stringify(pending) }
+      : stored
     let resolution = outcome(part)
     const keepResult = previous && hasResult(previous.resolution) && !hasResult(resolution)
     const unobserved =
@@ -75,6 +81,16 @@ export const createToolResolutions = (kernel: Kernel) => {
         OR tool_resolutions.resolution IS NOT excluded.resolution
         OR tool_resolutions.resolved_at IS NOT excluded.resolved_at`)
         .run(run.id, part.callId, run.threadId, JSON.stringify(next), resolution, next.resolvedAt ?? null)
+    if (!persist && (pending || interrupted(resolution))) {
+      const parts = pendingInterruptions.get(run.id) ?? new Map<string, ToolPart>()
+      parts.set(part.callId, next)
+      pendingInterruptions.set(run.id, parts)
+    }
+    if (persist) {
+      const parts = pendingInterruptions.get(run.id)
+      parts?.delete(part.callId)
+      if (!parts?.size) pendingInterruptions.delete(run.id)
+    }
     return next
   }
   const finish = (
@@ -123,6 +139,7 @@ export const createToolResolutions = (kernel: Kernel) => {
     return result
   }
   const clearPending = (runId: string): void => {
+    pendingInterruptions.delete(runId)
     database?.query("DELETE FROM tool_recovery_pending WHERE run_id = ?").run(runId)
   }
   const getPendingRuns = (threadId?: string): RecoveryRun[] =>

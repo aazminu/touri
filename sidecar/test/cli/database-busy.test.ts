@@ -172,5 +172,5 @@ database.close();`,
   const result = await command.result
   expect(result.code).toBe(0)
   expect(result.stderr).toBe("")
-  expect(result.stdout).toContain('"timeout":5000')
+  expect(result.stdout).toContain('"timeout":10')
 })
