@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import type { ApprovalPart } from "@touri/contracts"
+import axe from "axe-core"
 import { afterEach, expect, it, vi } from "vitest"
 import App from "../src/App"
 import { createMockApi } from "../src/api/mock"
@@ -281,4 +282,25 @@ it("leaves search indexing idle while the palette is closed", async () => {
 
   expect(input).toHaveFocus()
   expect(index).toHaveBeenCalled()
+})
+
+it("drops the listbox role when a query has no matches, announces empty results once, and has zero axe violations", async () => {
+  await start()
+  const input = await openPalette()
+  const dialog = screen.getByRole("dialog", { name: DIALOG })
+
+  expect(within(dialog).getByRole("listbox", { name: "Resultados" })).toBeVisible()
+  const nonEmptyAxe = await axe.run(dialog, { rules: { "color-contrast": { enabled: false } } })
+  expect(nonEmptyAxe.violations.map((v) => v.id)).toEqual([])
+
+  fireEvent.change(input, { target: { value: "zzzz" } })
+
+  expect(within(dialog).queryByRole("listbox")).toBeNull()
+  const statuses = within(dialog).getAllByRole("status")
+  expect(statuses).toHaveLength(1)
+  expect(statuses[0]).toHaveTextContent("Nenhum resultado encontrado.")
+  expect(within(dialog).getAllByText("Nenhum resultado encontrado.")).toHaveLength(1)
+
+  const emptyAxe = await axe.run(dialog, { rules: { "color-contrast": { enabled: false } } })
+  expect(emptyAxe.violations.map((v) => v.id)).toEqual([])
 })
