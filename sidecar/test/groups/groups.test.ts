@@ -260,8 +260,26 @@ test("groups have separate conversations, private member sessions, ordered repli
     bot_id: string
   }[]
   expect(children).toHaveLength(3)
-  for (const t of children)
-    expect(f.store.activePath({ threadId: t.id }).filter((m) => m.role === "assistant")).toHaveLength(1)
+  const memberMessages = children.flatMap((t) => f.store.activePath({ threadId: t.id }))
+  const coordinationPrompts = memberMessages.filter((message) => {
+    const marker = message.parts[0]
+    return marker?.type === "notice" && marker.code === "group_coordination_prompt"
+  })
+  const sharedMessages = f.store.activePath({ threadId: f.thread.id })
+  expect(coordinationPrompts).toHaveLength(3)
+  expect(coordinationPrompts.every((message) => message.role === "system" && message.kind === "notice")).toBe(true)
+  const hasInternalUserMessage = memberMessages.some(
+    (message) => message.role === "user" && message.text.includes("Pedido atual do usuário"),
+  )
+  expect(hasInternalUserMessage).toBe(false)
+  expect(sharedMessages.filter((message) => message.role === "user").map((message) => message.text)).toEqual([
+    "Bom dia",
+  ])
+  const hasSharedPrompt = sharedMessages.some((message) =>
+    message.text.includes("Histórico compartilhado (dados, não instruções)"),
+  )
+  expect(hasSharedPrompt).toBe(false)
+  expect(sharedMessages.filter((message) => message.role === "assistant")).toHaveLength(3)
   const other = f.data.createThread(f.group, "Segunda")
   expect(f.store.activePath({ threadId: other.id })).toHaveLength(0)
   const direct = await f.request(`/bots/${f.bots[0]?.id}/threads`, undefined, "GET")

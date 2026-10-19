@@ -457,6 +457,11 @@ export const VirtualMessageList = ({
 const isResumeMarker = (message: Message): boolean =>
   message.role === "system" && message.parts.some((part) => part.type === "notice" && part.code === "run_resumed")
 
+const isGroupCoordinationPrompt = (message: Message): boolean => {
+  const marker = message.parts[0]
+  return message.role === "system" && marker?.type === "notice" && marker.code === "group_coordination_prompt"
+}
+
 const sameCalendarDay = (left: number, right: number): boolean => {
   const first = new Date(left)
   const second = new Date(right)
@@ -991,7 +996,7 @@ export const ChatPanel = ({
     )
 
   const messagePath = group
-    ? messages.filter((message) => message.threadId === thread.id)
+    ? messages.filter((message) => message.threadId === thread.id && !isGroupCoordinationPrompt(message))
     : (activePath ??
       activeMessagePath(
         messages.filter((message) => message.threadId === thread.id),
