@@ -67,54 +67,86 @@ export const instrumentMainConnection = <Connection extends Database>(
   database: Connection,
   tracker: SlowStatementTracker,
 ): Connection => {
-  // Bun caches prepared statements by SQL; keep the cached identity through this proxy.
+  // Bun caches prepared statements by SQL; keep each wrapped statement's identity.
   const statementProxies = new WeakMap<Statement, Statement>()
-  const overrides = new Map<PropertyKey, unknown>()
+  const connection = Object.create(Object.getPrototypeOf(database)) as Connection
 
-  return new Proxy(database, {
-    get: (target, property) => {
-      if (overrides.has(property)) return overrides.get(property)
-      // Keep explicit overrides visible to instrumentation consumers such as spies.
-      if (Object.hasOwn(target, property)) return Reflect.get(target, property, target) as unknown
+  getDatabaseMembers(database).forEach(({ property, descriptor }) => {
+    const value = Reflect.get(database, property, database) as unknown
+    if (typeof value === "function") {
+      Object.defineProperty(connection, property, {
+        configurable: true,
+        enumerable: descriptor.enumerable ?? false,
+        writable: true,
+        value: instrumentDatabaseMethod({ database, property, value, tracker, statementProxies }),
+      })
+      return
+    }
 
-      const value = Reflect.get(target, property, target) as unknown
-      if (property === "query" || property === "prepare")
-        return (sql: string, ...args: Array<unknown>) =>
-          tracker.run(sql, () => {
-            const statement = Reflect.apply(value as (...values: Array<unknown>) => Statement, target, [sql, ...args])
-            return instrumentStatement(statement, sql, tracker, statementProxies)
-          })
-      if (property === "run" || property === "exec")
-        return (sql: string, ...args: Array<unknown>) =>
-          tracker.run(sql, () => Reflect.apply(value as (...values: Array<unknown>) => unknown, target, [sql, ...args]))
-      if (property === "transaction")
-        return (action: (...args: Array<unknown>) => unknown) => {
-          const transaction = Reflect.apply(value as (...values: Array<unknown>) => unknown, target, [action])
-          return instrumentTransaction(transaction, tracker)
-        }
-      if (typeof value === "function") return value.bind(target)
+    Object.defineProperty(connection, property, {
+      configurable: true,
+      enumerable: descriptor.enumerable ?? false,
+      get: () => Reflect.get(database, property, database) as unknown,
+      set: (next) => Reflect.set(database, property, next, database),
+    })
+  })
 
-      return value
-    },
-    set: (target, property, value) => {
-      const updated = Reflect.set(target, property, value, target)
-      if (updated) overrides.set(property, value)
+  return connection
+}
 
-      return updated
-    },
-    defineProperty: (target, property, descriptor) => {
-      const updated = Reflect.defineProperty(target, property, descriptor)
-      if (updated && "value" in descriptor) overrides.set(property, descriptor.value)
+const getDatabaseMembers = (database: Database): Array<{ property: PropertyKey; descriptor: PropertyDescriptor }> => {
+  const members = new Map<PropertyKey, PropertyDescriptor>()
+  const ownMembers = Reflect.ownKeys(database).flatMap((property) => {
+    const descriptor = Object.getOwnPropertyDescriptor(database, property)
+    return descriptor ? [[property, descriptor] as const] : []
+  })
+  ownMembers.forEach(([property, descriptor]) => {
+    members.set(property, descriptor)
+  })
 
-      return updated
-    },
-    deleteProperty: (target, property) => {
-      const deleted = Reflect.deleteProperty(target, property)
-      if (deleted) overrides.delete(property)
+  let prototype = Object.getPrototypeOf(database) as object | null
+  while (prototype && prototype !== Object.prototype) {
+    Reflect.ownKeys(prototype).forEach((property) => {
+      if (property === "constructor" || members.has(property)) return
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, property)
+      if (descriptor) members.set(property, descriptor)
+    })
+    prototype = Object.getPrototypeOf(prototype) as object | null
+  }
 
-      return deleted
-    },
-  }) as Connection
+  return Array.from(members, ([property, descriptor]) => ({ property, descriptor }))
+}
+
+const instrumentDatabaseMethod = ({
+  database,
+  property,
+  value,
+  tracker,
+  statementProxies,
+}: {
+  database: Database
+  property: PropertyKey
+  value: unknown
+  tracker: SlowStatementTracker
+  statementProxies: WeakMap<Statement, Statement>
+}): unknown => {
+  const method = value as (...args: Array<unknown>) => unknown
+  if (property === "query" || property === "prepare")
+    return (sql: string, ...args: Array<unknown>) =>
+      tracker.run(sql, () => {
+        const statement = Reflect.apply(method, database, [sql, ...args]) as Statement
+        return instrumentStatement(statement, sql, tracker, statementProxies)
+      })
+  if (property === "run" || property === "exec")
+    return (sql: string, ...args: Array<unknown>) =>
+      tracker.run(sql, () => Reflect.apply(method, database, [sql, ...args]))
+  if (property === "transaction")
+    return (action: (...args: Array<unknown>) => unknown) => {
+      const transaction = Reflect.apply(method, database, [action])
+      return instrumentTransaction(transaction, tracker)
+    }
+
+  return method.bind(database)
 }
 
 const instrumentStatement = (
