@@ -1,6 +1,10 @@
 import type { Kernel } from "@touri/contracts"
+import type { PerformanceStageRunner } from "../kernel/performance"
 
 export type ChildProcess = Extract<ReturnType<Kernel["spawnTree"]>, { success: true }>
+const PROVIDER_FRAME_BATCH_SIZE = 64
+
+const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
 
 /** Observe diagnostics as they arrive, including writes split across chunks. */
 export const readProviderStderr = async (stream: ReadableStream<Uint8Array>, observe: (text: string) => void) => {
@@ -40,10 +44,12 @@ export const startLineReader = ({
   stream,
   onLine,
   onError,
+  runStage,
 }: {
   stream: ReadableStream<Uint8Array>
   onLine: (line: string) => void
   onError: (error: Error) => void
+  runStage?: PerformanceStageRunner
 }): (() => void) => {
   let stopped = false
   void (async () => {
@@ -55,13 +61,41 @@ export const startLineReader = ({
         const result = await reader.read()
         if (result.done) break
         buffer += decoder.decode(result.value, { stream: true })
-        let newline = buffer.indexOf("\n")
-        while (newline >= 0) {
-          const line = buffer.slice(0, newline).trim()
-          buffer = buffer.slice(newline + 1)
-          if (line) onLine(line)
-          newline = buffer.indexOf("\n")
+        let offset = 0
+        let processed = 0
+        let lines: Array<string> = []
+        let newline = buffer.indexOf("\n", offset)
+        while (newline >= 0 && !stopped) {
+          const line = buffer.slice(offset, newline).trim()
+          offset = newline + 1
+          if (line) lines.push(line)
+          processed += 1
+          if (processed === PROVIDER_FRAME_BATCH_SIZE) {
+            const processLines = ({ values }: { values: Array<string> }): void => {
+              for (const value of values) {
+                if (stopped) break
+                onLine(value)
+              }
+            }
+            if (runStage) runStage("provider_frame_batch", processLines, { values: lines })
+            else processLines({ values: lines })
+            lines = []
+            processed = 0
+            await yieldToEventLoop()
+          }
+          newline = buffer.indexOf("\n", offset)
         }
+        if (lines.length) {
+          const processLines = ({ values }: { values: Array<string> }): void => {
+            for (const value of values) {
+              if (stopped) break
+              onLine(value)
+            }
+          }
+          if (runStage) runStage("provider_frame_batch", processLines, { values: lines })
+          else processLines({ values: lines })
+        }
+        buffer = buffer.slice(offset)
       }
       const tail = buffer.trim()
       if (!stopped && tail) onLine(tail)
