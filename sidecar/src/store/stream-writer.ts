@@ -541,11 +541,22 @@ export const createStreamWriter = ({
     void persistence.close()
   }
 
-  const drainAsync = async ({ stopping = false }: { stopping?: boolean } = {}): Promise<void> => {
+  const drainAsync = async ({
+    stopping = false,
+    threadId,
+    messageId,
+  }: {
+    stopping?: boolean
+    threadId?: string
+    messageId?: string
+  } = {}): Promise<void> => {
     if (timer) clearTimeout(timer)
     timer = null
     const deadline = stopping ? Date.now() + 2_000 : Number.POSITIVE_INFINITY
-    const watermark = new Set(pending.concat(inFlight))
+    const inScope = (event: PendingEvent): boolean =>
+      (threadId === undefined || event.threadId === threadId) &&
+      (messageId === undefined || event.messageId === messageId)
+    const watermark = new Set(pending.concat(inFlight).filter(inScope))
     const hasWatermark = (): boolean =>
       pending.some((event) => watermark.has(event)) || inFlight.some((event) => watermark.has(event))
     while (hasWatermark() && Date.now() < deadline) {

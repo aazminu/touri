@@ -596,7 +596,7 @@ test("stream writes retry a busy database without waiting on the main loop", asy
       delta: "x".repeat(STREAM_WRITE_LIMITS.bytes),
     }),
   ).not.toThrow()
-  expect((f.database.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(10)
+  expect((f.database.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(5_000)
   expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(0)
   await Bun.sleep(30)
   expect(timerFired).toBe(true)
@@ -904,4 +904,40 @@ test("quarantined writes fail their durability boundary before approval can cont
   expect(batchErrors.filter((busy) => !busy)).toHaveLength(4)
   expect(f.events.some(({ event }) => event.type === "message.delta")).toBe(false)
   expect(f.database.query("SELECT COUNT(*) AS n FROM rejections").get()).toEqual({ n: 1 })
+})
+
+test("a scoped drain ignores a rejected message from another thread", async () => {
+  const f = await fixture()
+  cleanups.add(f.close)
+  f.database.exec("INSERT INTO threads(id,bot_id,title,created_at,updated_at) VALUES ('other','b','Outra',1,1)")
+  const created = f.store.insertMessage({
+    message: {
+      id: "other-reply",
+      threadId: "other",
+      parentId: null,
+      role: "assistant",
+      kind: "text",
+      status: "streaming",
+      runId: null,
+      text: "",
+      parts: [{ type: "text", text: "" }],
+      sender: null,
+      source: "local",
+    },
+  })
+  if (!created.success) throw new Error(created.error)
+  f.database.exec(`CREATE TRIGGER fail_other_stream BEFORE INSERT ON transcript_entries
+    WHEN NEW.thread_id = 'other' AND json_extract(NEW.event_json,'$.type') = 'message.delta'
+    BEGIN SELECT RAISE(ABORT, 'Synthetic permanent failure'); END`)
+
+  f.store.appendDelta({ threadId: "other", messageId: "other-reply", partIndex: 0, delta: "Rejeitado" })
+  f.store.flushWrites?.()
+  f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "Confirmado" })
+
+  await expect(f.store.flushWritesAsync?.({ threadId: "t", messageId: "a" })).resolves.toBeUndefined()
+
+  expect(f.database.query("SELECT text FROM messages WHERE thread_id = 't' AND id = 'a'").get()).toEqual({
+    text: "Confirmado",
+  })
+  expect(f.database.query("SELECT COUNT(*) AS n FROM rejections WHERE thread_id = 'other'").get()).toEqual({ n: 1 })
 })

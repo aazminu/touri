@@ -68,6 +68,7 @@ export const createStreamPersistence = ({
   let retryTimer: ReturnType<typeof setTimeout> | undefined
   let workerNumber = 0
   let startupAttempts = 0
+  let busyStartupAttempts = 0
   let ready = false
   let running = false
   let stopping = false
@@ -121,9 +122,15 @@ export const createStreamPersistence = ({
     ready = false
     running = false
   }
-  const failStartup = (): void => {
+  const failStartup = (busy = false): void => {
     reportError()
     stopWorker()
+    if (busy) {
+      busyStartupAttempts += 1
+      scheduleRetry(busyStartupAttempts, startWorker)
+      return
+    }
+    busyStartupAttempts = 0
     startupAttempts += 1
     if (startupAttempts < MAX_ATTEMPTS) {
       scheduleRetry(startupAttempts, startWorker)
@@ -198,13 +205,14 @@ export const createStreamPersistence = ({
         if (data?.type === "ready") {
           clearTimeout(startupTimer)
           startupAttempts = 0
+          busyStartupAttempts = 0
           ready = true
           resolveReady()
           commitHead()
           return
         }
         if (data?.type === "startup-error") {
-          failStartup()
+          failStartup(data.busy)
           return
         }
         if (data?.type === "batch-error") {

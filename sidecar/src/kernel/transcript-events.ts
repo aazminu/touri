@@ -11,6 +11,12 @@ export type TranscriptRef = {
 
 /** Capture inside the writer transaction: the journal owns each body exactly once. */
 export const captureTranscript = (database: Database): void => {
+  const checkpointRow = database
+    .query("SELECT value FROM schema_meta WHERE key = 'transcript_event_checkpoint'")
+    .get() as { value: string } | null
+  const checkpoint = Number(checkpointRow?.value ?? 0)
+  if (!database.query("SELECT 1 FROM transcript_entries WHERE id > ? LIMIT 1").get(checkpoint)) return
+
   database
     .transaction(() => {
       const checkpoint = Number(

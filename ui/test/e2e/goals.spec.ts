@@ -13,12 +13,21 @@ viewports.forEach((viewport) => {
     await page.emulateMedia({ reducedMotion: "reduce" })
     await page.goto("/")
     await expect(page.getByRole("textbox", { name: "Mensagem para mark" })).toBeVisible()
+    await expect(page.locator(".goal-panel")).toHaveCount(0)
 
-    await page.getByText("Avançado · Continuar até concluir", { exact: true }).click()
-    await page
+    await page.getByRole("button", { name: "Painel do bot" }).click()
+    const botPanel = page.getByRole("complementary", { name: "Painel de mark" })
+    const goalEntry = botPanel.getByRole("button", { name: "Definir objetivo", exact: true })
+    await expect(goalEntry).toBeVisible()
+    await goalEntry.click()
+    await botPanel
       .getByRole("textbox", { name: "O que precisa estar pronto para concluir?" })
       .fill("Tabela com três opções, preços e fontes verificadas.")
-    await page.getByRole("button", { name: "Continuar até concluir", exact: true }).click()
+    await botPanel.getByRole("button", { name: "Continuar até concluir", exact: true }).click()
+    const confirmation = botPanel.getByRole("status")
+    await expect(confirmation).toHaveText("Objetivo iniciado nesta conversa")
+    await expect(confirmation).toBeFocused()
+    await botPanel.getByRole("button", { name: "Fechar painel do bot" }).click()
 
     const panel = page.getByRole("region", { name: "Continuar até concluir" })
     await expect(panel.getByRole("status")).toHaveText("Em andamento")
@@ -31,14 +40,12 @@ viewports.forEach((viewport) => {
     expect(await panel.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1)
 
     await panel.getByRole("button", { name: "Concluir agora", exact: true }).click()
-    await expect(panel.getByRole("status")).toHaveText("Objetivo concluído")
-    const newGoal = panel.getByRole("button", { name: "Novo objetivo", exact: true })
-    await expect(newGoal).toHaveAttribute("aria-expanded", "false")
-    await expect(panel.getByRole("button")).toHaveCount(1)
-    await expect(panel.getByRole("textbox")).toHaveCount(0)
-    const bounds = await panel.boundingBox()
-    expect(bounds?.height).toBeLessThan(90)
+    await expect(panel).toHaveCount(0)
 
+    await page.getByRole("button", { name: "Painel do bot" }).click()
+    const reopenedBotPanel = page.getByRole("complementary", { name: "Painel de mark" })
+    const newGoal = reopenedBotPanel.getByRole("button", { name: "Novo objetivo", exact: true })
+    await expect(newGoal).toHaveAttribute("aria-expanded", "false")
     const directory = process.env.TOURI_GOAL_SHOTS_DIR
     if (directory) {
       await page.screenshot({
@@ -50,8 +57,7 @@ viewports.forEach((viewport) => {
 
     await newGoal.click()
     await expect(newGoal).toHaveAttribute("aria-expanded", "true")
-    await expect(panel.getByRole("status")).toHaveText("Objetivo concluído")
-    const criterion = panel.getByRole("textbox", { name: "O que precisa estar pronto para concluir?" })
+    const criterion = reopenedBotPanel.getByRole("textbox", { name: "O que precisa estar pronto para concluir?" })
     await expect(criterion).toBeFocused()
     await criterion.fill("Resumo revisado.")
     if (directory) {
@@ -61,10 +67,14 @@ viewports.forEach((viewport) => {
         animations: "disabled",
       })
     }
-    await panel.getByRole("button", { name: "Continuar até concluir", exact: true }).click()
+    await reopenedBotPanel.getByRole("button", { name: "Continuar até concluir", exact: true }).click()
 
-    await expect(panel.getByRole("status")).toHaveText("Em andamento")
-    await expect(panel).toContainText("Resumo revisado.")
+    const nextConfirmation = reopenedBotPanel.getByRole("status")
+    await expect(nextConfirmation).toHaveText("Objetivo iniciado nesta conversa")
+    await expect(nextConfirmation).toBeFocused()
+    const nextGoal = page.getByRole("region", { name: "Continuar até concluir" })
+    await expect(nextGoal.getByRole("status")).toHaveText("Em andamento")
+    await expect(nextGoal).toContainText("Resumo revisado.")
     await expect(newGoal).toHaveCount(0)
   })
 })

@@ -1,3 +1,4 @@
+import { Database as SqliteDatabase } from "bun:sqlite"
 import { afterEach, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -208,6 +209,36 @@ test("startup materialization failure has a finite retry budget and rejects buff
   expect(f.errors).toHaveLength(1)
   expect(f.published).toEqual([{ type: "transcript.resync" }])
   await expect(f.persistence.submit([getDelta("other")])).rejects.toThrow("could not start")
+})
+
+test("busy startup retries past the permanent startup failure limit", async () => {
+  let blocker: SqliteDatabase | undefined
+  let starts = 0
+  let busyErrors = 0
+  const f = await getFixture(
+    () => {
+      starts += 1
+      const worker = createSourceWorker(streamPersistenceWorkerSource)
+      worker.addEventListener("message", ({ data }) => {
+        if (data.type !== "startup-error" || !data.busy) return
+        busyErrors += 1
+        if (busyErrors === 5) blocker?.exec("ROLLBACK")
+      })
+      return worker
+    },
+    (database) => {
+      blocker = new SqliteDatabase(database.filename)
+      blocker.exec("BEGIN IMMEDIATE")
+      cleanups.add(() => blocker?.close())
+    },
+  )
+
+  await f.persistence.ready
+  const committed = await f.persistence.submit([getDelta()])
+
+  expect(busyErrors).toBe(5)
+  expect(starts).toBe(6)
+  expect(committed.events).toHaveLength(1)
 })
 
 test.each(["bytes", "events"] as const)(

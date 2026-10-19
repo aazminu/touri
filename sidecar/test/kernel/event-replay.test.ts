@@ -6,6 +6,7 @@ import { join } from "node:path"
 import type { MessagePart, UiEventEnvelope } from "@touri/contracts"
 import { createKernel } from "../../src/kernel"
 import { createEventBus, REPLAY_LIMITS } from "../../src/kernel/event-bus"
+import type { PerformanceStageRunner } from "../../src/kernel/performance"
 import { init as initStore } from "../../src/store"
 import { socketTicket } from "../fakes/ws-ticket"
 
@@ -211,6 +212,65 @@ test("capturing an unpublished transcript releases its reader before checkpointi
     expect(f.db.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toMatchObject({ busy: 0 })
     bus.stop()
   } finally {
+    await f.close()
+  }
+})
+
+test("a synchronous publish waits out a worker lock without taking an empty capture lock", async () => {
+  const f = await fixture()
+  const url = URL.createObjectURL(
+    new Blob(
+      [
+        `import { Database } from "bun:sqlite";
+        self.onmessage = ({ data }) => {
+          const database = new Database(data.filename);
+          database.exec("BEGIN IMMEDIATE");
+          Atomics.store(new Int32Array(data.signal), 0, 1);
+          self.postMessage("locked");
+          setTimeout(() => {
+            database.exec("ROLLBACK");
+            Atomics.store(new Int32Array(data.signal), 0, 0);
+            database.close();
+            self.postMessage("released");
+          }, 200);
+        };`,
+      ],
+      { type: "application/javascript" },
+    ),
+  )
+  const worker = new Worker(url, { smol: true, ref: false })
+  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)
+  const locked = Promise.withResolvers<void>()
+  const released = Promise.withResolvers<void>()
+  worker.onmessage = ({ data }: MessageEvent<string>) => {
+    if (data === "locked") locked.resolve()
+    if (data === "released") released.resolve()
+  }
+  worker.onerror = (event) => locked.reject(new Error(event.message))
+  worker.postMessage({ filename: f.db.filename, signal })
+  let captureFinishedWhileLocked = false
+  const runStage: PerformanceStageRunner = (stage, action, input) => {
+    const result = action(input as Parameters<typeof action>[0])
+    if (stage === "transcript_journal_capture")
+      captureFinishedWhileLocked = Atomics.load(new Int32Array(signal), 0) === 1
+    return result
+  }
+  const bus = createEventBus(f.db, runStage)
+  try {
+    await locked.promise
+
+    expect(() =>
+      bus.publish({ type: "import.progress", importId: "worker-lock", phase: "done", done: 1, total: 1 }),
+    ).not.toThrow()
+    await released.promise
+
+    expect(captureFinishedWhileLocked).toBe(true)
+    expect(bus.replay(0).at(-1)?.event).toMatchObject({ type: "import.progress", importId: "worker-lock" })
+    expect((f.db.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(5_000)
+  } finally {
+    bus.stop()
+    worker.terminate()
+    URL.revokeObjectURL(url)
     await f.close()
   }
 })

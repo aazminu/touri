@@ -52,6 +52,8 @@ export const createEventBus = (
   let flushing = false
   let compactedAt = delivered
   let retentionTimer: ReturnType<typeof setTimeout> | undefined
+  let captureRetryTimer: ReturnType<typeof setTimeout> | undefined
+  let captureRetryAttempt = 0
   const serialize = (envelope: UiEventEnvelope): string =>
     JSON.stringify(envelope.event.type === "transcript.resync" ? { type: "resync", lastSeq: envelope.seq } : envelope)
   const payloadFor = (envelope: UiEventEnvelope): string =>
@@ -91,10 +93,27 @@ export const createEventBus = (
     measureStage("workspace_websocket_broadcast", broadcast, { payload, seq: envelope.seq })
   }
 
+  const scheduleCaptureRetry = (): void => {
+    if (stopped || captureRetryTimer) return
+    const delayMs = Math.min(1_000, 50 * 2 ** Math.min(captureRetryAttempt, 4))
+    captureRetryAttempt += 1
+    captureRetryTimer = setTimeout(() => {
+      captureRetryTimer = undefined
+      captureTranscript()
+    }, delayMs)
+    captureRetryTimer.unref()
+  }
+
   // Also recovers a committed tail whose publisher stopped before delivery.
   const captureTranscript = (): void => {
     if (!database || stopped) return
-    measureStage("transcript_journal_capture", captureEntries, database)
+    try {
+      measureStage("transcript_journal_capture", captureEntries, database)
+      captureRetryAttempt = 0
+    } catch (error) {
+      if (!isSqliteBusy(error)) throw error
+      scheduleCaptureRetry()
+    }
   }
 
   const scheduleRetention = (): void => {
@@ -365,6 +384,7 @@ export const createEventBus = (
       stopped = true
       cancelContinuation?.()
       clearTimeout(retentionTimer)
+      clearTimeout(captureRetryTimer)
       sockets = []
     },
   }

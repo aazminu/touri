@@ -215,7 +215,7 @@ test("long agentic turns bound durable commits, row mutations and physical WAL b
     if (!baseline) {
       expect(metrics.commits).toBeLessThanOrEqual(350)
       expect(metrics.rowWrites).toBeGreaterThan(2_000)
-      expect(metrics.rowWrites).toBeLessThanOrEqual(10_000)
+      expect(metrics.rowWrites).toBeLessThanOrEqual(3_500)
       expect(metrics.bytesWritten).toBeLessThanOrEqual(32 * 1024 * 1024)
       expect(metrics.blobBytes).toBe(12 * 1024)
       expect(reply?.parts[1]).toMatchObject({ outputAttachmentId: expect.any(String), outputBytes: 12 * 1024 })
