@@ -31,6 +31,7 @@ type BenchmarkResult = {
   parts: number
   providerCpuMs: number
   attributedMs: number
+  attributedCpuMs: number
   maxBlockMs: number
   duplicateSharesRun: boolean
   duplicateActiveRuns: number
@@ -98,12 +99,14 @@ const getTrackedRunner = () => {
   const tracker = createPerformanceStageTracker()
   let depth = 0
   let attributedMs = 0
+  let attributedCpuMs = 0
   let maxBlockMs = 0
   let firstFrameCpu: NodeJS.CpuUsage | null = null
   const stageTimes = new Map<PerformanceStage, { calls: number; totalMs: number; maxMs: number }>()
   const runStage: PerformanceStageRunner = (stage, action, input) => {
     if (stage === "provider_frame_batch" && firstFrameCpu === null) firstFrameCpu = process.cpuUsage()
     const parentDepth = depth
+    const cpuStartedAt = parentDepth === 0 && firstFrameCpu !== null ? process.cpuUsage() : null
     depth += 1
     const startedAt = performance.now()
     try {
@@ -120,6 +123,10 @@ const getTrackedRunner = () => {
       if (parentDepth === 0 && firstFrameCpu !== null) {
         attributedMs += elapsed
         maxBlockMs = Math.max(maxBlockMs, elapsed)
+        if (cpuStartedAt) {
+          const cpu = process.cpuUsage(cpuStartedAt)
+          attributedCpuMs += (cpu.user + cpu.system) / 1_000
+        }
       }
     }
   }
@@ -134,6 +141,7 @@ const getTrackedRunner = () => {
       return {
         providerCpuMs: (cpu.user + cpu.system) / 1_000,
         attributedMs,
+        attributedCpuMs,
         maxBlockMs,
         stages,
       }
@@ -224,6 +232,7 @@ const runReplay = async (count: number): Promise<BenchmarkResult> => {
     await Bun.sleep(5)
   }
   expect(queued.run.status).toBe("succeeded")
+  const performanceResult = stages.getResult()
   store.flushWrites?.()
   await Bun.sleep(5)
   const reply = store.activePath({ threadId }).find((message) => message.role === "assistant")
@@ -236,7 +245,7 @@ const runReplay = async (count: number): Promise<BenchmarkResult> => {
     busPartsEvents: events.filter((type) => type === "message.parts").length,
     duplicateSharesRun: duplicate.run.id === queued.run.id && duplicate.run === queued.run,
     duplicateActiveRuns,
-    ...stages.getResult(),
+    ...performanceResult,
   }
   console.log(`provider-event-benchmark ${JSON.stringify(result)}`)
   return result
@@ -254,6 +263,7 @@ test("Provider event cost grows linearly and duplicate starts share one run", as
   expect(result.duplicateActiveRuns).toBe(1)
   expect(result.providerCpuMs).toBeGreaterThan(0)
   expect(result.providerCpuMs / small.providerCpuMs).toBeLessThan(3)
+  expect(result.attributedCpuMs / result.providerCpuMs).toBeGreaterThanOrEqual(0.9)
   expect(result.stages.some(({ name }) => name === "runtime_turn_finalization")).toBe(true)
   expect(result.stages.find(({ name }) => name === "provider_frame_batch")?.maxMs ?? Infinity).toBeLessThan(50)
   expect(result.stages.find(({ name }) => name === "runtime_provider_event")?.maxMs ?? Infinity).toBeLessThan(50)
