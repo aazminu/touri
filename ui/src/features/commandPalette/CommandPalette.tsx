@@ -245,8 +245,7 @@ export const CommandPalette = ({
             ref={listRef}
             id={`${baseId}-listbox`}
             className="command-palette-list"
-            role={flat.length > 0 ? "listbox" : undefined}
-            aria-label={flat.length > 0 ? "Resultados" : undefined}
+            {...(flat.length > 0 ? { role: "listbox" as const, "aria-label": "Resultados" } : {})}
           >
             {flat.length === 0 ? (
               <p className="command-palette-empty" aria-hidden="true">
