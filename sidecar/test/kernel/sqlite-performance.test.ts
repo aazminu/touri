@@ -48,6 +48,17 @@ test("main connection reports normalized statements at the 250 ms threshold", ()
   expect(JSON.stringify(log.mock.calls)).not.toContain("private-")
 })
 
+test("bound values remain private on a slow get", () => {
+  const log = mock<Kernel["log"]>()
+  const times = [0, 0, 0, 300]
+  const database = getDatabase({ log, now: () => times.shift() ?? 300 })
+
+  expect(database.query("SELECT ? AS value").get("private-bound")).toEqual({ value: "private-bound" })
+
+  expect(log).toHaveBeenCalled()
+  expect(JSON.stringify(log.mock.calls)).not.toContain("private-bound")
+})
+
 test("the main connection preserves Bun's cached statement identity", () => {
   const log = mock<Kernel["log"]>()
   const database = getDatabase({ log, now: () => 0 })
@@ -58,6 +69,20 @@ test("the main connection preserves Bun's cached statement identity", () => {
   expect(second).toBe(first)
 })
 
+test("statement wrappers are cached on the statement", () => {
+  const log = mock<Kernel["log"]>()
+  const database = getDatabase({ log, now: () => 0 })
+  const statement = database.query("SELECT id FROM fixture")
+
+  expect(statement.run).toBe(statement.run)
+  expect(statement.get).toBe(statement.get)
+  expect(statement.all).toBe(statement.all)
+  expect(statement.values).toBe(statement.values)
+  expect(statement.raw).toBe(statement.raw)
+  expect(statement.iterate).toBe(statement.iterate)
+  expect(statement.as).toBe(statement.as)
+})
+
 test("main connection query overrides remain observable", () => {
   const log = mock<Kernel["log"]>()
   const database = getDatabase({ log, now: () => 0 })
@@ -66,6 +91,71 @@ test("main connection query overrides remain observable", () => {
   database.query("SELECT id FROM fixture").all()
 
   expect(query).toHaveBeenCalledTimes(1)
+})
+
+test("slow iterators and transaction calls are reported", () => {
+  const log = mock<Kernel["log"]>()
+  let at = 0
+  const database = getDatabase({ log, now: () => (at += 300) })
+  const transaction = database.transaction(() =>
+    database.query("INSERT INTO fixture (label) VALUES (?)").run("synthetic"),
+  )
+
+  expect(transaction.deferred).toBe(transaction.deferred)
+  expect(transaction.immediate).toBe(transaction.immediate)
+  expect(transaction.exclusive).toBe(transaction.exclusive)
+  transaction.toString()
+  expect(log).not.toHaveBeenCalled()
+
+  transaction.immediate()
+  Array.from(database.query("SELECT id FROM fixture").iterate())
+
+  const loggedSql = log.mock.calls.map(([entry]) => entry.data?.sql)
+  expect(loggedSql).toContain("TRANSACTION")
+  expect(loggedSql).toContain("INSERT INTO fixture (label) VALUES (?)")
+  expect(loggedSql).toContain("SELECT id FROM fixture")
+})
+
+test("slow Database.run and Database.exec calls are reported", () => {
+  const log = mock<Kernel["log"]>()
+  let at = 0
+  const database = getDatabase({ log, now: () => (at += 300) })
+
+  database.run("INSERT INTO fixture (label) VALUES (?)", ["synthetic"])
+  database.exec("UPDATE fixture SET label = 'updated'")
+
+  const loggedSql = log.mock.calls.map(([entry]) => entry.data?.sql)
+  expect(loggedSql).toContain("INSERT INTO fixture (label) VALUES (?)")
+  expect(loggedSql).toContain("UPDATE fixture SET label = ?")
+})
+
+test("a SQLite error passes through without replacement", () => {
+  const log = mock<Kernel["log"]>()
+  const rawDatabase = new Database(":memory:")
+  databases.add(rawDatabase)
+  let sqliteError: unknown
+  try {
+    rawDatabase.query("SELECT * FROM missing_fixture")
+  } catch (error) {
+    sqliteError = error
+  }
+  if (!(sqliteError instanceof Error)) throw new Error("Expected SQLite to reject the missing table")
+
+  const query = spyOn(rawDatabase, "query").mockImplementation(() => {
+    throw sqliteError
+  })
+  cleanups.add(query.mockRestore)
+  const tracker = createSlowStatementTracker({ log, getStage: () => "workspace_snapshot", now: () => 0 })
+  const database = instrumentMainConnection(rawDatabase, tracker)
+  let thrown: unknown
+
+  try {
+    database.query("SELECT 1")
+  } catch (error) {
+    thrown = error
+  }
+
+  expect(thrown).toBe(sqliteError)
 })
 
 test("slow statement totals appear in the event-loop lag report", () => {
@@ -89,9 +179,8 @@ test("slow statement totals appear in the event-loop lag report", () => {
   })
   cleanups.add(diagnostics.stop)
 
-  slowStatements.run("SELECT id FROM fixture WHERE id = 1", () => {
-    at += 300
-  })
+  slowStatements.recordDuration("SELECT id FROM fixture WHERE id = 1", 300)
+  Array.from({ length: 10 }, () => slowStatements.recordDuration("SELECT id FROM fixture WHERE id = 2", 10))
   stageTracker.run("workspace_snapshot", () => {
     at += 1_000
   })
@@ -108,6 +197,7 @@ test("slow statement totals appear in the event-loop lag report", () => {
       maxMs: 300,
     },
   ])
+  expect(report?.data?.sqliteStatementTotals).toEqual({ calls: 11, totalMs: 400 })
 })
 
 test("the stage tracker exposes the active stage through async nesting", async () => {

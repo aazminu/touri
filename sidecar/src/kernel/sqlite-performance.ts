@@ -9,16 +9,25 @@ export type SlowStatement = {
   maxMs: number
 }
 
+export type SqliteStatementTotals = {
+  calls: number
+  totalMs: number
+}
+
 export type SlowStatementTracker = {
-  run: <Value>(sql: string, action: () => Value) => Value
   now: () => number
   recordDuration: (sql: string, durationMs: number) => void
   snapshot: () => Array<SlowStatement>
+  snapshotTotals: () => SqliteStatementTotals
   reset: () => void
 }
 
 const DEFAULT_THRESHOLD_MS = 250
 const MAX_NORMALIZED_SQL_LENGTH = 512
+const TIMED_STATEMENT_METHODS = new Set<PropertyKey>(["run", "get", "all", "values", "raw"])
+const TRANSACTION_MODES = ["deferred", "immediate", "exclusive"] as const
+const SQL_REDACTION_TOKENS =
+  /--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)|'(?:''|[^'])*'|'(?:''|[^'])*$|"(?:""|[^"])*"|"(?:""|[^"])*$|`(?:``|[^`])*`|`(?:``|[^`])*$|\[(?:\]\]|[^\]])*\]|\[(?:\]\]|[^\]])*$/g
 
 export const createSlowStatementTracker = ({
   log,
@@ -32,8 +41,12 @@ export const createSlowStatementTracker = ({
   thresholdMs?: number
 }): SlowStatementTracker => {
   let timings: Array<SlowStatement> = []
+  let totalCalls = 0
+  let totalMs = 0
 
   const recordDuration = (sql: string, durationMs: number): void => {
+    totalCalls += 1
+    totalMs += durationMs
     if (durationMs < thresholdMs) return
 
     const statement = normalizeSql(sql)
@@ -43,22 +56,15 @@ export const createSlowStatementTracker = ({
     timings = recordSlowStatement(timings, timing)
   }
 
-  const run = <Value>(sql: string, action: () => Value): Value => {
-    const startedAt = now()
-    try {
-      return action()
-    } finally {
-      recordDuration(sql, now() - startedAt)
-    }
-  }
-
   return {
-    run,
     now,
     recordDuration,
     snapshot: () => timings.map((timing) => ({ ...timing })),
+    snapshotTotals: () => ({ calls: totalCalls, totalMs: getMilliseconds(totalMs) }),
     reset: () => {
       timings = []
+      totalCalls = 0
+      totalMs = 0
     },
   }
 }
@@ -95,26 +101,28 @@ export const instrumentMainConnection = <Connection extends Database>(
 }
 
 const getDatabaseMembers = (database: Database): Array<{ property: PropertyKey; descriptor: PropertyDescriptor }> => {
-  const members = new Map<PropertyKey, PropertyDescriptor>()
-  const ownMembers = Reflect.ownKeys(database).flatMap((property) => {
-    const descriptor = Object.getOwnPropertyDescriptor(database, property)
-    return descriptor ? [[property, descriptor] as const] : []
-  })
-  ownMembers.forEach(([property, descriptor]) => {
-    members.set(property, descriptor)
+  const ownMembers = getOwnMembers(database)
+  const inheritedMembers = getPrototypeMembers(Object.getPrototypeOf(database))
+
+  return [...ownMembers, ...inheritedMembers].filter(
+    (member, index, members) => members.findIndex((existing) => existing.property === member.property) === index,
+  )
+}
+
+const getOwnMembers = (target: object): Array<{ property: PropertyKey; descriptor: PropertyDescriptor }> =>
+  Reflect.ownKeys(target).flatMap((property) => {
+    const descriptor = Object.getOwnPropertyDescriptor(target, property)
+    return descriptor ? [{ property, descriptor }] : []
   })
 
-  let prototype = Object.getPrototypeOf(database) as object | null
-  while (prototype && prototype !== Object.prototype) {
-    Reflect.ownKeys(prototype).forEach((property) => {
-      if (property === "constructor" || members.has(property)) return
-      const descriptor = Object.getOwnPropertyDescriptor(prototype, property)
-      if (descriptor) members.set(property, descriptor)
-    })
-    prototype = Object.getPrototypeOf(prototype) as object | null
-  }
+const getPrototypeMembers = (
+  prototype: object | null,
+): Array<{ property: PropertyKey; descriptor: PropertyDescriptor }> => {
+  if (!prototype || prototype === Object.prototype) return []
 
-  return Array.from(members, ([property, descriptor]) => ({ property, descriptor }))
+  const ownMembers = getOwnMembers(prototype).filter(({ property }) => property !== "constructor")
+
+  return [...ownMembers, ...getPrototypeMembers(Object.getPrototypeOf(prototype))]
 }
 
 const instrumentDatabaseMethod = ({
@@ -132,14 +140,26 @@ const instrumentDatabaseMethod = ({
 }): unknown => {
   const method = value as (...args: Array<unknown>) => unknown
   if (property === "query" || property === "prepare")
-    return (sql: string, ...args: Array<unknown>) =>
-      tracker.run(sql, () => {
-        const statement = Reflect.apply(method, database, [sql, ...args]) as Statement
+    return (...args: Array<unknown>) => {
+      const sql = args[0] as string
+      const startedAt = tracker.now()
+      try {
+        const statement = Reflect.apply(method, database, args) as Statement
         return instrumentStatement(statement, sql, tracker, statementProxies)
-      })
+      } finally {
+        tracker.recordDuration(sql, tracker.now() - startedAt)
+      }
+    }
   if (property === "run" || property === "exec")
-    return (sql: string, ...args: Array<unknown>) =>
-      tracker.run(sql, () => Reflect.apply(method, database, [sql, ...args]))
+    return (...args: Array<unknown>) => {
+      const sql = args[0] as string
+      const startedAt = tracker.now()
+      try {
+        return Reflect.apply(method, database, args)
+      } finally {
+        tracker.recordDuration(sql, tracker.now() - startedAt)
+      }
+    }
   if (property === "transaction")
     return (action: (...args: Array<unknown>) => unknown) => {
       const transaction = Reflect.apply(method, database, [action])
@@ -158,28 +178,30 @@ const instrumentStatement = (
   const existing = statementProxies.get(statement)
   if (existing) return existing
 
+  const statementMethods = [
+    ...Array.from(
+      TIMED_STATEMENT_METHODS,
+      (property) => [property, createTimedStatementMethod(statement, property, sql, tracker)] as const,
+    ),
+    ["iterate", createIteratorMethod(statement, "iterate", sql, tracker)] as const,
+    [Symbol.iterator, createIteratorMethod(statement, Symbol.iterator, sql, tracker)] as const,
+    ["as", createAsMethod(statement, sql, tracker, statementProxies)] as const,
+  ] as const
+  const wrappedMethods = new Map<PropertyKey, unknown>(statementMethods.filter(([, method]) => method !== undefined))
+  const boundMethods = new Map<PropertyKey, (...args: Array<unknown>) => unknown>()
   const proxy = new Proxy(statement, {
     get: (target, property) => {
+      if (wrappedMethods.has(property)) return wrappedMethods.get(property)
+
       const value = Reflect.get(target, property, target) as unknown
-      if (["run", "get", "all", "values", "raw"].includes(String(property)))
-        return (...args: Array<unknown>) =>
-          tracker.run(sql, () => Reflect.apply(value as (...values: Array<unknown>) => unknown, target, args))
-      if (property === "iterate" || property === Symbol.iterator)
-        return (...args: Array<unknown>) =>
-          instrumentIterator(
-            Reflect.apply(value as (...values: Array<unknown>) => IterableIterator<unknown>, target, args),
-            sql,
-            tracker,
-          )
-      if (property === "as")
-        return (...args: Array<unknown>) =>
-          instrumentStatement(
-            Reflect.apply(value as (...values: Array<unknown>) => Statement, target, args),
-            sql,
-            tracker,
-            statementProxies,
-          )
-      if (typeof value === "function") return value.bind(target)
+      if (typeof value === "function") {
+        const bound = boundMethods.get(property)
+        if (bound) return bound
+
+        const binding = value.bind(target) as (...args: Array<unknown>) => unknown
+        boundMethods.set(property, binding)
+        return binding
+      }
 
       return value
     },
@@ -189,18 +211,87 @@ const instrumentStatement = (
   return proxy
 }
 
+const createTimedStatementMethod = (
+  statement: Statement,
+  property: PropertyKey,
+  sql: string,
+  tracker: SlowStatementTracker,
+): unknown => {
+  const method = Reflect.get(statement, property, statement) as unknown
+  if (typeof method !== "function") return undefined
+
+  return (...args: Array<unknown>) => {
+    const startedAt = tracker.now()
+    try {
+      return Reflect.apply(method, statement, args)
+    } finally {
+      tracker.recordDuration(sql, tracker.now() - startedAt)
+    }
+  }
+}
+
+const createIteratorMethod = (
+  statement: Statement,
+  property: PropertyKey,
+  sql: string,
+  tracker: SlowStatementTracker,
+): unknown => {
+  const method = Reflect.get(statement, property, statement) as unknown
+  if (typeof method !== "function") return undefined
+
+  return (...args: Array<unknown>) =>
+    instrumentIterator(Reflect.apply(method, statement, args) as IterableIterator<unknown>, sql, tracker)
+}
+
+const createAsMethod = (
+  statement: Statement,
+  sql: string,
+  tracker: SlowStatementTracker,
+  statementProxies: WeakMap<Statement, Statement>,
+): unknown => {
+  const method = Reflect.get(statement, "as", statement) as unknown
+  if (typeof method !== "function") return undefined
+
+  return (...args: Array<unknown>) =>
+    instrumentStatement(Reflect.apply(method, statement, args) as Statement, sql, tracker, statementProxies)
+}
+
 const instrumentTransaction = (transaction: unknown, tracker: SlowStatementTracker): unknown => {
   if (typeof transaction !== "function") return transaction
 
-  return new Proxy(transaction, {
-    apply: (target, thisArgument, args) => tracker.run("TRANSACTION", () => Reflect.apply(target, thisArgument, args)),
-    get: (target, property, receiver) => {
-      const value = Reflect.get(target, property, receiver) as unknown
-      if (typeof value !== "function") return value
+  const wrappedModes = new Map<PropertyKey, unknown>(
+    TRANSACTION_MODES.map((property) => {
+      const method = Reflect.get(transaction, property, transaction) as unknown
+      if (typeof method !== "function") return [property, undefined] as const
 
-      return new Proxy(value, {
-        apply: (mode, _thisArgument, args) => tracker.run("TRANSACTION", () => Reflect.apply(mode, transaction, args)),
-      })
+      return [
+        property,
+        (...args: Array<unknown>) => {
+          const startedAt = tracker.now()
+          try {
+            return Reflect.apply(method, transaction, args)
+          } finally {
+            tracker.recordDuration("TRANSACTION", tracker.now() - startedAt)
+          }
+        },
+      ] as const
+    }).filter(([, method]) => method !== undefined),
+  )
+
+  return new Proxy(transaction, {
+    apply: (target, thisArgument, args) => {
+      const startedAt = tracker.now()
+      try {
+        return Reflect.apply(target, thisArgument, args)
+      } finally {
+        tracker.recordDuration("TRANSACTION", tracker.now() - startedAt)
+      }
+    },
+    get: (target, property, receiver) => {
+      if (wrappedModes.has(property)) return wrappedModes.get(property)
+
+      const value = Reflect.get(target, property, receiver) as unknown
+      return value
     },
   })
 }
@@ -210,18 +301,16 @@ const instrumentIterator = (
   sql: string,
   tracker: SlowStatementTracker,
 ): IterableIterator<unknown> => {
-  let startedAt: number | undefined
   let finished = false
   let totalMs = 0
 
   const finish = (): void => {
-    if (finished || startedAt === undefined) return
+    if (finished) return
     finished = true
     tracker.recordDuration(sql, totalMs)
   }
 
   const next = (...args: Array<unknown>): IteratorResult<unknown> => {
-    startedAt ??= tracker.now()
     const callStartedAt = tracker.now()
     try {
       const result = Reflect.apply(iterator.next, iterator, args) as IteratorResult<unknown>
@@ -235,14 +324,54 @@ const instrumentIterator = (
     }
   }
 
-  return {
+  const iteratorThrow = iterator.throw
+  const wrappedThrow =
+    typeof iteratorThrow === "function"
+      ? {
+          throw: (error?: unknown) => {
+            const callStartedAt = tracker.now()
+            try {
+              const result = Reflect.apply(iteratorThrow, iterator, [error]) as IteratorResult<unknown>
+              totalMs += tracker.now() - callStartedAt
+              if (result.done) finish()
+              return result
+            } catch (caught) {
+              totalMs += tracker.now() - callStartedAt
+              finish()
+              throw caught
+            }
+          },
+        }
+      : {}
+
+  const wrappedIterator = {
     next,
     return: (value?: unknown) => {
       finish()
       return iterator.return ? Reflect.apply(iterator.return, iterator, [value]) : { done: true, value }
     },
+    ...wrappedThrow,
     [Symbol.iterator]() {
       return this
+    },
+  }
+
+  const disposeSymbol = Reflect.get(Symbol, "dispose") as symbol | undefined
+  if (!disposeSymbol) return wrappedIterator
+
+  const dispose = Reflect.get(iterator, disposeSymbol) as unknown
+  if (typeof dispose !== "function") return wrappedIterator
+
+  return {
+    ...wrappedIterator,
+    [disposeSymbol]() {
+      const callStartedAt = tracker.now()
+      try {
+        return Reflect.apply(dispose, iterator, [])
+      } finally {
+        totalMs += tracker.now() - callStartedAt
+        finish()
+      }
     },
   }
 }
@@ -295,75 +424,12 @@ const recordSlowStatement = (
   ].slice(-32)
 }
 
-const normalizeSql = (sql: string): string => {
-  const tokens: Array<string> = []
-  let index = 0
-  while (index < sql.length) {
-    const character = sql[index]
-    const next = sql[index + 1]
-    if (character === "-" && next === "-") {
-      index = skipLineComment(sql, index + 2)
-      tokens.push(" ")
-      continue
-    }
-    if (character === "/" && next === "*") {
-      index = skipBlockComment(sql, index + 2)
-      tokens.push(" ")
-      continue
-    }
-    if (character === "'") {
-      index = skipQuoted(sql, index + 1, "'")
-      tokens.push("?")
-      continue
-    }
-    if (character === '"' || character === "`" || character === "[") {
-      index = skipQuoted(sql, index + 1, character === "[" ? "]" : character)
-      tokens.push("?")
-      continue
-    }
-    tokens.push(character ?? "")
-    index += 1
-  }
-
-  return tokens
-    .join("")
+const normalizeSql = (sql: string): string =>
+  sql
+    .replace(SQL_REDACTION_TOKENS, (token) => (token.startsWith("--") || token.startsWith("/*") ? " " : "?"))
     .replace(/\b(?:0x[\da-f]+|\d+(?:\.\d+)?(?:e[+-]?\d+)?)\b/gi, "?")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, MAX_NORMALIZED_SQL_LENGTH)
-}
-
-const skipLineComment = (sql: string, start: number): number => {
-  const end = sql.indexOf("\n", start)
-
-  return end < 0 ? sql.length : end + 1
-}
-
-const skipBlockComment = (sql: string, start: number): number => {
-  const end = sql.indexOf("*/", start)
-
-  return end < 0 ? sql.length : end + 2
-}
-
-const skipQuoted = (sql: string, start: number, closing: string): number => readQuoted(sql, start, closing).nextIndex
-
-const readQuoted = (sql: string, start: number, closing: string): { nextIndex: number } => {
-  let index = start
-  while (index < sql.length) {
-    const character = sql[index]
-    if (character !== closing) {
-      index += 1
-      continue
-    }
-    if (sql[index + 1] === closing) {
-      index += 2
-      continue
-    }
-
-    return { nextIndex: index + 1 }
-  }
-
-  return { nextIndex: sql.length }
-}
 
 const getMilliseconds = (value: number): number => Math.round(value * 1_000) / 1_000
