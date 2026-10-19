@@ -59,11 +59,15 @@ const getDelta = (threadId = "thread", delta = "durable") => ({
 })
 
 const createSourceWorker = (source: string): Worker => {
-  const url = URL.createObjectURL(new Blob([source], { type: "application/javascript" }))
-  const worker = new Worker(url, { smol: true, ref: false })
+  const diagnosticSource = source.replace("busy: isBusy(error) });", "busy: isBusy(error), detail: String(error) });")
+  const diagnosticUrl = URL.createObjectURL(new Blob([diagnosticSource], { type: "application/javascript" }))
+  const worker = new Worker(diagnosticUrl, { smol: true, ref: false })
+  worker.addEventListener("message", ({ data }) => {
+    if (data.type === "batch-error" && !data.busy) console.info("synthetic-stream-error", data.detail)
+  })
   cleanups.add(() => {
     worker.terminate()
-    URL.revokeObjectURL(url)
+    URL.revokeObjectURL(diagnosticUrl)
   })
   return worker
 }

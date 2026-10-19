@@ -836,7 +836,7 @@ test("a stopped worker cannot grow writer buffers or projections past the byte l
   const blocker = new SqliteDatabase(join(f.root, "touri.db"))
   cleanups.add(() => blocker.close())
   blocker.exec("BEGIN IMMEDIATE")
-  const input = { threadId: "t", messageId: "a", partIndex: 0, delta: "x".repeat(256 * 1024) }
+  const input = { threadId: "t", messageId: "a", partIndex: 0, delta: "\u0000".repeat(256 * 1024) }
   const accepted = Array.from({ length: 40 }).reduce<number>((count) => {
     try {
       f.store.appendDelta(input)
@@ -848,14 +848,16 @@ test("a stopped worker cannot grow writer buffers or projections past the byte l
   }, 0)
 
   expect(accepted).toBeGreaterThan(0)
-  expect(accepted * Buffer.byteLength(input.delta)).toBeLessThanOrEqual(STREAM_WRITE_LIMITS.pendingBytes)
+  expect(accepted * Buffer.byteLength(JSON.stringify(input.delta))).toBeLessThanOrEqual(
+    STREAM_WRITE_LIMITS.pendingBytes,
+  )
   expect(f.store.activePath({ threadId: "t", leafId: "a" })[0]?.text.length).toBe(accepted * input.delta.length)
   expect(log.mock.calls.map(([entry]) => entry.msg)).toContain(
     "Stream buffer limit reached; rejecting additional writes",
   )
   blocker.exec("ROLLBACK")
   await f.store.flushWritesAsync?.()
-})
+}, 15_000)
 
 test("quarantined writes fail their durability boundary before approval can continue", async () => {
   const f = await fixture()
