@@ -12,6 +12,7 @@ import { createSecretStore } from "./host/secretStore"
 import { startHeadlessStderr } from "./nativeStderr"
 import { remoteAccessWarning } from "./remoteAccessWarning"
 import { clearServeInfo, writeServeInfo } from "./serveInfo"
+import { registerServeShutdown } from "./serveShutdown"
 import { exposeOnTailscale } from "./tailscale"
 import { cliVersion } from "./version"
 import { createWebGate } from "./web/gate"
@@ -88,24 +89,21 @@ const startServer = async (options: ServeOptions, stopStderr: () => Promise<void
       : "pairing: run `touri pair` for a one-time code",
   )
 
-  let stopping = false
-  const shutdown = (): void => {
-    if (stopping) return
-    stopping = true
-    const deadline = setTimeout(() => process.exit(1), 10_000)
-    deadline.unref()
-    void (async () => {
-      await runtime.kernel.services.use("runtime.shutdown")?.()
+  registerServeShutdown({
+    drainTimeoutMs: options.drainTimeoutMs,
+    beginDrain: () => runtime.kernel.services.use("runtime.beginDrain")?.(),
+    shutdown: async () => {
+      await runtime.kernel.services.use("runtime.shutdown")?.({ appRestart: true })
+    },
+    log: runtime.kernel.log,
+    finish: async () => {
       runtime.emitHostNotification({ method: "app.willQuit", params: {} })
       await runtime.kernel.services.use("vm.shutdown")?.()
       clearServeInfo(options.dataDir)
-      runtime.stop()
+      await runtime.stop()
       store.close()
       lease.release()
       await stopStderr()
-      process.exit(0)
-    })().catch(() => process.exit(1))
-  }
-  process.once("SIGTERM", shutdown)
-  process.once("SIGINT", shutdown)
+    },
+  })
 }

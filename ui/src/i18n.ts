@@ -100,7 +100,9 @@ export const ptBR = {
   "Goal pause": "Pausar",
   "Goal resume": "Retomar",
   "Continue until done": "Continuar até concluir",
-  "Goal advanced": "Avançado · Continuar até concluir",
+  "Goal title": "Objetivo",
+  "Goal setup": "Definir objetivo",
+  "Goal started in conversation": "Objetivo iniciado nesta conversa",
   "Goal mode help":
     "Continua a última solicitação entre turnos, dentro dos limites abaixo. As aprovações continuam obrigatórias. Disponível para bots locais.",
   "Goal folder required":
@@ -622,6 +624,10 @@ export const ptBR = {
   "O Mem0 não respondeu a tempo. Tente de novo.": "O Mem0 não respondeu a tempo. Tente de novo.",
   "O servidor retornou uma resposta inválida. Confira a URL do Mem0.":
     "O servidor retornou uma resposta inválida. Confira a URL do Mem0.",
+  "O servidor está encerrando.": "O servidor está encerrando.",
+  "Segundo sinal recebido; interrompendo o encerramento gradual.":
+    "Segundo sinal recebido; interrompendo o encerramento gradual.",
+  "O encerramento gradual falhou; interrompendo o runtime.": "O encerramento gradual falhou; interrompendo o runtime.",
   "Não foi possível conectar ao Mem0. Confira a conexão e a URL e tente de novo.":
     "Não foi possível conectar ao Mem0. Confira a conexão e a URL e tente de novo.",
   "Não foi possível carregar o Mem0.": "Não foi possível carregar o Mem0.",
@@ -2556,7 +2562,9 @@ const englishOverrides: Partial<Record<TranslationKey, string>> = {
   "Goal pause": "Pause",
   "Goal resume": "Resume",
   "Continue until done": "Continue until done",
-  "Goal advanced": "Advanced · Continue until done",
+  "Goal title": "Goal",
+  "Goal setup": "Set up goal",
+  "Goal started in conversation": "Goal started in this conversation",
   "Goal mode help":
     "Continue the latest request across turns within these limits. Approvals remain mandatory. Available for local bots.",
   "Goal folder required":
@@ -3074,6 +3082,10 @@ const englishOverrides: Partial<Record<TranslationKey, string>> = {
   "O Mem0 não respondeu a tempo. Tente de novo.": "Mem0 did not respond in time. Try again.",
   "O servidor retornou uma resposta inválida. Confira a URL do Mem0.":
     "The server returned an invalid response. Check the Mem0 URL.",
+  "O servidor está encerrando.": "The server is shutting down.",
+  "Segundo sinal recebido; interrompendo o encerramento gradual.":
+    "Second signal received; interrupting graceful shutdown.",
+  "O encerramento gradual falhou; interrompendo o runtime.": "Graceful shutdown failed; interrupting the runtime.",
   "Não foi possível conectar ao Mem0. Confira a conexão e a URL e tente de novo.":
     "Could not connect to Mem0. Check your connection and the URL, then try again.",
   "Não foi possível carregar o Mem0.": "Could not load Mem0.",

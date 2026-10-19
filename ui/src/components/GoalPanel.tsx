@@ -11,12 +11,18 @@ export const GoalPanel = ({
   bot,
   request,
   busy,
+  surface = "standalone",
+  refreshRequest = 0,
+  onChange,
 }: {
   api: UiApi
   threadId: Id
   bot: Bot
-  request: Message | undefined
+  request?: Message | undefined
   busy: boolean
+  surface?: "chat" | "entry" | "standalone"
+  refreshRequest?: number
+  onChange?: (() => void) | undefined
 }) => {
   const [goal, setGoal] = useState<Goal | null>(null)
   const [loaded, setLoaded] = useState(false)
@@ -25,12 +31,16 @@ export const GoalPanel = ({
   const [loadFailed, setLoadFailed] = useState(false)
   const [editing, setEditing] = useState(false)
   const [advanced, setAdvanced] = useState(false)
+  const [started, setStarted] = useState(false)
   const [criterion, setCriterion] = useState("")
   const [turns, setTurns] = useState(4)
   const [minutes, setMinutes] = useState(15)
   const [now, setNow] = useState(Date.now)
   const refreshGoal = useRef<() => void>(() => {})
   const criterionInput = useRef<HTMLTextAreaElement>(null)
+  const startConfirmation = useRef<HTMLParagraphElement>(null)
+  const previousRefreshRequest = useRef(refreshRequest)
+  const showStarted = surface === "entry" && started && goal !== null && goal.status !== "completed"
   const id = useId()
   const hasScope = bot.machine === "local" && !!(bot.projectId || bot.folders?.length || bot.anyFolderAccess)
 
@@ -70,17 +80,30 @@ export const GoalPanel = ({
   }, [api, threadId])
 
   useEffect(() => {
-    if (goal?.status !== "active") return
+    if (refreshRequest === previousRefreshRequest.current) return
+
+    previousRefreshRequest.current = refreshRequest
+    refreshGoal.current()
+  }, [refreshRequest])
+
+  useEffect(() => {
+    if (surface === "entry" || goal?.status !== "active") return
 
     const timer = setInterval(() => refreshGoal.current(), 2000)
     return () => clearInterval(timer)
-  }, [goal?.status])
+  }, [goal?.status, surface])
 
   useEffect(() => {
     if (!advanced) return
 
     criterionInput.current?.focus()
   }, [advanced])
+
+  useEffect(() => {
+    if (!showStarted) return
+
+    startConfirmation.current?.focus()
+  }, [showStarted])
 
   const control = async (input: GoalControl) => {
     setPending(true)
@@ -90,6 +113,7 @@ export const GoalPanel = ({
       setGoal(response.goal)
       setNow(Date.now())
       setEditing(false)
+      onChange?.()
     } catch {
       setFailed(true)
     } finally {
@@ -111,7 +135,9 @@ export const GoalPanel = ({
       setGoal(response.goal)
       setNow(Date.now())
       setAdvanced(false)
+      setStarted(true)
       setCriterion("")
+      onChange?.()
     } catch {
       setFailed(true)
     } finally {
@@ -150,10 +176,24 @@ export const GoalPanel = ({
 
   const isBudgetExhausted = goal?.status === "budget_exhausted"
   const lastStep = goal?.steps.at(-1)?.text ?? (isBudgetExhausted ? null : t("Goal waiting for checkpoint"))
+  const showCheckpoint = Boolean(goal) && surface !== "entry" && !(surface === "chat" && goal?.status === "completed")
+  const showEntry =
+    surface === "standalone"
+      ? !goal || goal.status === "completed"
+      : surface === "entry" && loaded && (!goal || goal.status === "completed")
+  const showError = failed || loadFailed
+
+  if (!showCheckpoint && !showEntry && !showError && !showStarted) return null
 
   return (
-    <section className="goal-panel" aria-label={t("Continue until done")}>
-      {goal && (
+    <section className="goal-panel" aria-label={t(surface === "entry" ? "Goal title" : "Continue until done")}>
+      {surface === "entry" && <h3>{t("Goal title")}</h3>}
+      {showStarted && (
+        <p ref={startConfirmation} role="status" tabIndex={-1}>
+          {t("Goal started in conversation")}
+        </p>
+      )}
+      {showCheckpoint && goal && (
         <GoalCheckpoint status={goal.status}>
           <div className="goal-heading">
             <strong>{t("Continue until done")}</strong>
@@ -219,12 +259,8 @@ export const GoalPanel = ({
           )}
         </GoalCheckpoint>
       )}
-      {(!goal || goal.status === "completed") && (
-        <ChatDisclosure
-          label={t(goal ? "Goal new" : "Goal advanced")}
-          expanded={advanced}
-          onExpandedChange={setAdvanced}
-        >
+      {showEntry && (
+        <ChatDisclosure label={t(goal ? "Goal new" : "Goal setup")} expanded={advanced} onExpandedChange={setAdvanced}>
           {advanced && (
             <>
               <p>{t("Goal mode help")}</p>
@@ -253,7 +289,7 @@ export const GoalPanel = ({
           )}
         </ChatDisclosure>
       )}
-      {(failed || loadFailed) && <p role="alert">{t("Goal request failed")}</p>}
+      {showError && <p role="alert">{t("Goal request failed")}</p>}
     </section>
   )
 }
