@@ -259,41 +259,41 @@ const createAsMethod = (
 const instrumentTransaction = (transaction: unknown, tracker: SlowStatementTracker): unknown => {
   if (typeof transaction !== "function") return transaction
 
-  const wrappedModes = new Map<PropertyKey, unknown>(
-    TRANSACTION_MODES.map((property) => {
-      const method = Reflect.get(transaction, property, transaction) as unknown
-      if (typeof method !== "function") return [property, undefined] as const
+  const wrappedModes = TRANSACTION_MODES.flatMap((property) => {
+    const method = Reflect.get(transaction, property, transaction) as unknown
+    if (typeof method !== "function") return []
+    const descriptor = Object.getOwnPropertyDescriptor(transaction, property)
 
-      return [
-        property,
-        (...args: Array<unknown>) => {
-          const startedAt = tracker.now()
-          try {
-            return Reflect.apply(method, transaction, args)
-          } finally {
-            tracker.recordDuration("TRANSACTION", tracker.now() - startedAt)
-          }
-        },
-      ] as const
-    }).filter(([, method]) => method !== undefined),
-  )
-
-  return new Proxy(transaction, {
-    apply: (target, thisArgument, args) => {
+    const wrappedMethod = (...args: Array<unknown>) => {
       const startedAt = tracker.now()
       try {
-        return Reflect.apply(target, thisArgument, args)
+        return Reflect.apply(method, transaction, args)
       } finally {
         tracker.recordDuration("TRANSACTION", tracker.now() - startedAt)
       }
-    },
-    get: (target, property, receiver) => {
-      if (wrappedModes.has(property)) return wrappedModes.get(property)
+    }
+    const wrappedDescriptor = {
+      configurable: descriptor?.configurable ?? true,
+      enumerable: descriptor?.enumerable ?? true,
+      writable: descriptor && "writable" in descriptor ? descriptor.writable : true,
+      value: wrappedMethod,
+    }
 
-      const value = Reflect.get(target, property, receiver) as unknown
-      return value
-    },
+    return [[property, wrappedDescriptor] as const]
   })
+
+  const wrappedTransaction = (...args: Array<unknown>) => {
+    const startedAt = tracker.now()
+    try {
+      return Reflect.apply(transaction, transaction, args)
+    } finally {
+      tracker.recordDuration("TRANSACTION", tracker.now() - startedAt)
+    }
+  }
+
+  Object.defineProperties(wrappedTransaction, Object.fromEntries(wrappedModes))
+
+  return wrappedTransaction
 }
 
 const instrumentIterator = (

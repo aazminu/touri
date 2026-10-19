@@ -135,7 +135,7 @@ test("a SQLite error passes through without replacement", () => {
   databases.add(rawDatabase)
   let sqliteError: unknown
   try {
-    rawDatabase.query("SELECT * FROM missing_fixture")
+    rawDatabase.query("SELECT * FROM missing_fixture").get()
   } catch (error) {
     sqliteError = error
   }
@@ -144,7 +144,7 @@ test("a SQLite error passes through without replacement", () => {
   const query = spyOn(rawDatabase, "query").mockImplementation(() => {
     throw sqliteError
   })
-  cleanups.add(query.mockRestore)
+  cleanups.add(() => query.mockRestore())
   const tracker = createSlowStatementTracker({ log, getStage: () => "workspace_snapshot", now: () => 0 })
   const database = instrumentMainConnection(rawDatabase, tracker)
   let thrown: unknown
