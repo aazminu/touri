@@ -251,9 +251,10 @@ const getRecoveryFixture = async () => {
   const runtime = getOfflineRuntime(root)
   await initStore(runtime.kernel)
   const database = runtime.kernel.db as Database
-  database.exec(`INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at)
-    VALUES ('bot','Synthetic','codex',?,1,1);
-    INSERT INTO threads(id,bot_id,title,created_at,updated_at) VALUES ('thread','bot','Synthetic',1,1);
+  database
+    .query("INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at) VALUES ('bot','Synthetic','codex',?,1,1)")
+    .run(root)
+  database.exec(`INSERT INTO threads(id,bot_id,title,created_at,updated_at) VALUES ('thread','bot','Synthetic',1,1);
     INSERT INTO settings(key,value_json,updated_at) VALUES ('resumeInterruptedTurns','false',1);`)
   const store = runtime.kernel.services.use("store.api")
   if (!store) throw new Error("Store missing")
