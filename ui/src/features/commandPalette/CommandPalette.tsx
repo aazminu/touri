@@ -225,7 +225,7 @@ export const CommandPalette = ({
               type="text"
               role="combobox"
               aria-label={PALETTE_INPUT_LABEL}
-              aria-expanded={open}
+              aria-expanded={open && flat.length > 0}
               aria-controls={`${baseId}-listbox`}
               aria-autocomplete="list"
               aria-activedescendant={activeIndex >= 0 ? optionId(activeIndex) : undefined}
@@ -241,15 +241,19 @@ export const CommandPalette = ({
             />
             <kbd>Esc</kbd>
           </div>
-          {flat.length > 0 ? (
-            <div
-              ref={listRef}
-              id={`${baseId}-listbox`}
-              className="command-palette-list"
-              role="listbox"
-              aria-label="Resultados"
-            >
-              {groups.map((group) => (
+          <div
+            ref={listRef}
+            id={`${baseId}-listbox`}
+            className="command-palette-list"
+            role={flat.length > 0 ? "listbox" : undefined}
+            aria-label={flat.length > 0 ? "Resultados" : undefined}
+          >
+            {flat.length === 0 ? (
+              <p className="command-palette-empty" aria-hidden="true">
+                Nenhum resultado encontrado.
+              </p>
+            ) : (
+              groups.map((group) => (
                 // biome-ignore lint/a11y/useSemanticElements: ARIA listbox groups are role="group"; a fieldset is not valid inside a listbox
                 <div key={group.id} role="group" aria-labelledby={`${baseId}-group-${group.id}`}>
                   <div id={`${baseId}-group-${group.id}`} className="command-palette-group" role="presentation">
@@ -287,15 +291,9 @@ export const CommandPalette = ({
                     )
                   })}
                 </div>
-              ))}
-            </div>
-          ) : (
-            <div ref={listRef} id={`${baseId}-listbox`} className="command-palette-list">
-              <p className="command-palette-empty" role="status" aria-live="polite">
-                Nenhum resultado encontrado.
-              </p>
-            </div>
-          )}
+              ))
+            )}
+          </div>
           <div className="command-palette-footer" aria-hidden="true">
             <span>
               <kbd>↑</kbd>
@@ -308,11 +306,9 @@ export const CommandPalette = ({
               <kbd>{paletteShortcutLabel()}</kbd> fechar
             </span>
           </div>
-          {flat.length > 0 && (
-            <p className="visually-hidden" role="status" aria-live="polite">
-              {open ? resultCountLabel(flat.length) : ""}
-            </p>
-          )}
+          <p className="visually-hidden" role="status" aria-live="polite">
+            {open ? resultCountLabel(flat.length) : ""}
+          </p>
         </div>
       </div>
     </MotionPresence>,

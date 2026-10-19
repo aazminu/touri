@@ -289,17 +289,23 @@ it("drops the listbox role when a query has no matches, announces empty results 
   const input = await openPalette()
   const dialog = screen.getByRole("dialog", { name: DIALOG })
 
+  expect(input).toHaveAttribute("aria-expanded", "true")
   expect(within(dialog).getByRole("listbox", { name: "Resultados" })).toBeVisible()
   const nonEmptyAxe = await axe.run(dialog, { rules: { "color-contrast": { enabled: false } } })
   expect(nonEmptyAxe.violations.map((v) => v.id)).toEqual([])
 
   fireEvent.change(input, { target: { value: "zzzz" } })
 
+  expect(input).toHaveAttribute("aria-expanded", "false")
   expect(within(dialog).queryByRole("listbox")).toBeNull()
   const statuses = within(dialog).getAllByRole("status")
   expect(statuses).toHaveLength(1)
+  expect(statuses[0]).toHaveClass("visually-hidden")
   expect(statuses[0]).toHaveTextContent("Nenhum resultado encontrado.")
-  expect(within(dialog).getAllByText("Nenhum resultado encontrado.")).toHaveLength(1)
+  const emptyCopy = dialog.querySelector(".command-palette-empty")
+  expect(emptyCopy).toHaveAttribute("aria-hidden", "true")
+  expect(emptyCopy).not.toHaveAttribute("role")
+  expect(emptyCopy).toHaveTextContent("Nenhum resultado encontrado.")
 
   const emptyAxe = await axe.run(dialog, { rules: { "color-contrast": { enabled: false } } })
   expect(emptyAxe.violations.map((v) => v.id)).toEqual([])
