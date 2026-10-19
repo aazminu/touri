@@ -31,6 +31,7 @@ import { approvalOutcome } from "../approvals/outcome"
 import { delegatedBot } from "../groups/security"
 import { createGroupStore } from "../groups/store"
 import { buildChildEnv } from "../kernel"
+import { writeDatabaseAsync } from "../kernel/database-write"
 import { folderAccessUnavailable, folderGrantProblem, refreshHostFolderAccess } from "../kernel/folder-capability"
 import { hasPathHistory } from "../kernel/message-path"
 import type { PerformanceStageRunner } from "../kernel/performance"
@@ -478,7 +479,7 @@ export const createRuntimeEngine = ({
       tools.clearPending(run.id)
     }
     // The terminal reply, run and tool resolutions have one winning writer.
-    if (kernel.db instanceof Database) kernel.db.transaction(write)()
+    if (kernel.db instanceof Database) await writeDatabaseAsync(kernel.db, write)
     else write()
   }
 
@@ -568,7 +569,7 @@ export const createRuntimeEngine = ({
       })
     else materializePendingText(state, runStage)
     if (state.cancelRequested) {
-      state.parts = tools.finish(run, state.parts, "cancelled_by_user")
+      state.parts = tools.finish(run, state.parts, "cancelled_by_user", false)
       for (let index = 0; index < state.parts.length; index++) state.dirtyParts.add(index)
     }
     if (status === "streaming" && store.appendParts) {
@@ -2006,7 +2007,7 @@ export const createRuntimeEngine = ({
     const state = getState(id)
     state.cancelRequested = true
     controllers.get(id)?.abort()
-    state.parts = tools.finish(run, state.parts, "cancelled_by_user")
+    state.parts = tools.finish(run, state.parts, "cancelled_by_user", false)
     const store = kernel.services.use("store.api")
     if (store) publishMessage({ store, state, run, status: "streaming" })
     approvalBridge.cancelRun(id)

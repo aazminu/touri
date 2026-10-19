@@ -28,6 +28,7 @@ import { getApiModel } from "../api-models/config"
 import { installDoctor } from "../doctor"
 import { parseBotFolders, protectedFolder } from "../kernel/bot-folders"
 import { DEFAULT_DATA_RETENTION_DAYS, validDataRetentionDays } from "../kernel/data-maintenance"
+import { writeDatabaseAsync } from "../kernel/database-write"
 import { SCHEMA_VERSION } from "../kernel/db"
 import {
   assertPrivateFile,
@@ -472,7 +473,11 @@ const writeSettings = ({ database, settings }: { database: Database; settings: A
   }
 }
 
-export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): Promise<void> => {
+export const init = async (
+  kernel: Kernel,
+  runStage?: PerformanceStageRunner,
+  createWorker?: (url: string) => Worker,
+): Promise<void> => {
   await refreshHostFolderAccess()
   installDoctor(kernel)
   const database = kernel.db as Database
@@ -513,6 +518,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     database,
     getMessage,
     getThread,
+    ...(createWorker ? { createWorker } : {}),
     ...(runStage ? { runStage } : {}),
   })
   await streamWriter.ready
@@ -597,9 +603,10 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
   }
 
   const updateMessage: StoreApi["updateMessage"] = ({ threadId, messageId, patch }) => {
-    if (patch.parts !== undefined && patch.text !== undefined) streamWriter.drain()
-    else flushDeltas()
-    const current = getMessage({ threadId, messageId })
+    const storedCurrent = getMessage({ threadId, messageId })
+    const projected =
+      storedCurrent?.status === "streaming" ? streamWriter.getProjectedMessage(threadId, messageId) : null
+    const current = projected ?? storedCurrent
     if (!current) return { success: false, errorCode: "NOT_FOUND", error: `Message ${messageId} was not found` }
     // A terminal run reply can still settle its tools, but its text and outcome are final.
     if (current.role === "assistant" && current.runId && current.status !== "streaming") {
@@ -623,10 +630,10 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     next.parts = externalizeMessageParts({ database, appData: kernel.paths.appData, parts: next.parts })
     const partsJson = JSON.stringify(next.parts)
     if (
-      next.status === current.status &&
-      next.text === current.text &&
-      next.runId === current.runId &&
-      partsJson === JSON.stringify(current.parts)
+      next.status === storedCurrent?.status &&
+      next.text === storedCurrent.text &&
+      next.runId === storedCurrent.runId &&
+      partsJson === JSON.stringify(storedCurrent.parts)
     )
       return { success: true, message: current }
     database
@@ -643,7 +650,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
 
   const updateMessageAsync: NonNullable<StoreApi["updateMessageAsync"]> = async (input) => {
     await streamWriter.drainAsync()
-    return updateMessage(input)
+    return writeDatabaseAsync(database, () => updateMessage(input))
   }
 
   const activePath: StoreApi["activePath"] = ({ threadId, leafId, limit, fromRoot = false }) => {

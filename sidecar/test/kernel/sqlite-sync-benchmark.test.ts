@@ -4,7 +4,6 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { openDatabase } from "../../src/kernel/db"
-import { streamPersistenceWorkerSource } from "../../src/store/stream-persistence-worker"
 
 const canRunSyncBenchmark = process.platform === "linux" && Bun.which("cc") !== null
 const compilerPath = Bun.which("cc")
@@ -152,147 +151,119 @@ test.skipIf(!canRunSyncBenchmark)(
 
 const workerBenchmark = `import { Database } from "bun:sqlite";
 import { dlopen } from "bun:ffi";
-
+import { join } from "node:path";
+const { createKernel } = await import(process.env.TOURI_KERNEL);
+const { init } = await import(process.env.TOURI_STORE);
+const { createRuntimeEngine } = await import(process.env.TOURI_ENGINE);
+const { writeDatabaseAsync } = await import(process.env.TOURI_DATABASE_WRITE);
+const { streamPersistenceWorkerSource } = await import(process.env.TOURI_STREAM_WORKER);
 const library = dlopen(process.env.TOURI_SYNC_SHIM, {
   touri_start_sync_recording: { args: [], returns: "i32" },
   touri_stop_sync_recording: { args: [], returns: "i32" },
   touri_set_sync_delay_ms: { args: ["i32"], returns: "i32" },
 });
-const beforePath = process.env.TOURI_BEFORE_DB;
-const afterPath = process.env.TOURI_AFTER_DB;
-const authPath = process.env.TOURI_AUTH_DB;
-const authModulePath = process.env.TOURI_AUTH_STORE;
-const source = process.env.TOURI_STREAM_WORKER;
-const event = (index) => ({
-  type: "message.delta",
-  threadId: "thread",
-  messageId: "reply",
-  partIndex: 0,
-  partType: "text",
-  delta: "x",
-  offset: index,
-  generation: 1,
-  updatedAt: index + 1,
-});
-const events = Array.from({ length: 32 }, (_, index) => event(index));
 const measure = async (operation) => {
-  let eventLoopLagMs = 0;
-  let resolveSample;
-  const sampled = new Promise((resolve) => { resolveSample = resolve; });
-  const expectedAt = performance.now() + 5;
-  setTimeout(() => {
-    eventLoopLagMs = Math.max(0, performance.now() - expectedAt);
-    resolveSample();
+  let maxLagMs = 0;
+  let samples = 0;
+  let expectedAt = performance.now() + 5;
+  const probe = setInterval(() => {
+    maxLagMs = Math.max(maxLagMs, performance.now() - expectedAt);
+    expectedAt = performance.now() + 5;
+    samples += 1;
   }, 5);
   const startedAt = performance.now();
   await operation();
-  await sampled;
-  return { batchLatencyMs: Math.round(performance.now() - startedAt), eventLoopLagMs: Math.round(eventLoopLagMs) };
+  await Bun.sleep(10);
+  clearInterval(probe);
+  return { latencyMs: Math.round(performance.now() - startedAt), maxLagMs: Math.round(maxLagMs), samples };
 };
-const beforeDatabase = new Database(beforePath);
-beforeDatabase.exec("PRAGMA busy_timeout = 0; PRAGMA synchronous = FULL; PRAGMA wal_autocheckpoint = 0");
+const beforeDatabase = new Database(process.env.TOURI_BEFORE_DB);
+beforeDatabase.exec("PRAGMA synchronous = FULL; PRAGMA wal_autocheckpoint = 0");
 library.symbols.touri_set_sync_delay_ms(200);
-const beforeInsert = beforeDatabase.query(
-  "INSERT INTO transcript_entries(thread_id,seq,generation,event_json,at) VALUES ('thread',?,?,?,?)",
-);
-const before = await measure(() => {
-  library.symbols.touri_start_sync_recording();
-  beforeDatabase.transaction(() => {
-    events.forEach((value, index) => {
-      const seq = index + 2;
-      const saved = { ...value, updatedSeq: seq };
-      beforeDatabase.query("UPDATE threads SET updated_seq = ? WHERE id = 'thread'").run(seq);
-      beforeInsert.run(seq, 1, JSON.stringify(saved), saved.updatedAt);
-    });
-  })();
-});
-before.syncCalls = library.symbols.touri_stop_sync_recording();
 library.symbols.touri_start_sync_recording();
-const beforeCheckpoint = await measure(() => beforeDatabase.exec("PRAGMA wal_checkpoint(TRUNCATE)"));
-beforeCheckpoint.syncCalls = library.symbols.touri_stop_sync_recording();
-beforeDatabase.close();
-const { openAuthStore } = await import(authModulePath);
-const authStore = openAuthStore({ filename: authPath });
-const pairing = authStore.createPairingCode();
-library.symbols.touri_start_sync_recording();
-const auth = await measure(() => authStore.claimPairingCode({ code: pairing.code, deviceName: "Synthetic device" }));
-auth.syncCalls = library.symbols.touri_stop_sync_recording();
-authStore.close();
-
-const runWorker = async () => {
-  const url = URL.createObjectURL(new Blob([source], { type: "application/javascript" }));
-  const worker = new Worker(url, { smol: true, ref: false });
-  const result = await new Promise((resolve, reject) => {
-    let batchStartedAt = 0;
-    let batchExpectedAt = 0;
-    let batchEventLoopLagMs = 0;
-    let batchLatencyMs = 0;
-    let batchSyncCalls = 0;
-    let checkpointStartedAt = 0;
-    let checkpointExpectedAt = 0;
-    let checkpointEventLoopLagMs = 0;
-    worker.onmessage = ({ data }) => {
-      if (data.type === "ready") {
-        library.symbols.touri_start_sync_recording();
-        batchStartedAt = performance.now();
-        batchExpectedAt = batchStartedAt + 5;
-        setTimeout(() => { cancellationObserved = true; }, 10);
-        setTimeout(() => {
-          batchEventLoopLagMs = Math.max(0, performance.now() - batchExpectedAt);
-        }, 5);
-        worker.postMessage({
-          type: "batch",
-          batch: { id: "slow-sync-benchmark", events },
-        });
-        return;
-      }
-      if (data.type === "committed") {
-        batchLatencyMs = Math.round(performance.now() - batchStartedAt);
-        batchSyncCalls = library.symbols.touri_stop_sync_recording();
-        library.symbols.touri_start_sync_recording();
-        checkpointStartedAt = performance.now();
-        checkpointExpectedAt = checkpointStartedAt + 5;
-        setTimeout(() => {
-          checkpointEventLoopLagMs = Math.max(0, performance.now() - checkpointExpectedAt);
-        }, 5);
-        worker.postMessage({ type: "checkpoint" });
-        return;
-      }
-      if (data.type === "checkpointed") {
-        data.batchLatencyMs = batchLatencyMs;
-        data.batchEventLoopLagMs = Math.round(batchEventLoopLagMs);
-        data.batchSyncCalls = batchSyncCalls;
-        data.checkpointLatencyMs = Math.round(performance.now() - checkpointStartedAt);
-        data.checkpointEventLoopLagMs = Math.round(checkpointEventLoopLagMs);
-        data.checkpointSyncCalls = library.symbols.touri_stop_sync_recording();
-        worker.postMessage({ type: "stop" });
-        resolve(data);
-        return;
-      }
-      if (data.type === "startup-error" || data.type === "batch-error" || data.type === "checkpoint-error")
-        reject(new Error("Worker persistence failed"));
-    };
-    worker.onerror = () => reject(new Error("Worker persistence failed"));
-    worker.postMessage({ type: "start", filename: afterPath, synchronous: "FULL" });
+const before = await measure(() => beforeDatabase.transaction(() => {
+  Array.from({ length: 32 }).forEach((_, index) => {
+    beforeDatabase.query("UPDATE threads SET updated_seq = updated_seq + 1 WHERE id = 'thread'").run();
+    beforeDatabase.query("INSERT INTO transcript_entries(thread_id,seq,generation,event_json,at) VALUES ('thread',?,1,?,1)")
+      .run(index + 2, JSON.stringify({ type: "message.delta", threadId: "thread", messageId: "reply", partIndex: 0, delta: "x", offset: index }));
   });
-  worker.terminate();
-  URL.revokeObjectURL(url);
-  return result;
-};
-let cancellationObserved = false;
-const after = await runWorker();
-after.cancellationObserved = cancellationObserved;
-const verify = new Database(afterPath, { readonly: true });
-after.journalRows = verify.query(
-  "SELECT COUNT(*) AS count FROM transcript_entries WHERE json_extract(event_json,'$.type') = 'message.delta'",
-).get().count;
-after.text = verify.query("SELECT text FROM messages WHERE id = 'reply'").get().text;
-verify.close();
-console.log(JSON.stringify({ delayMs: 200, before, beforeCheckpoint, auth, after, afterCheckpoint: {
-  syncCalls: after.checkpointSyncCalls,
-  batchLatencyMs: after.checkpointLatencyMs,
-  eventLoopLagMs: after.checkpointEventLoopLagMs,
-} }));
+}).immediate());
+before.syncCalls = library.symbols.touri_stop_sync_recording();
+beforeDatabase.close();
+
+const directory = join(process.env.TOURI_BENCH_DIR, "production");
+const runtime = createKernel({ appData: directory });
+runtime.kernel.services.use("storage.maintenance")?.dispose();
+const database = runtime.kernel.db;
+const locked = Promise.withResolvers();
+const workerUrls = [];
+await init(runtime.kernel, undefined, () => {
+  const source = streamPersistenceWorkerSource.replace(
+    "database.transaction(() => writeBatch(data.batch)).immediate()",
+    'database.transaction(() => { self.postMessage({ type: "test-locked" }); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); return writeBatch(data.batch); }).immediate()',
+  );
+  const url = URL.createObjectURL(new Blob([source], { type: "application/javascript" }));
+  workerUrls.push(url);
+  const worker = new Worker(url, { smol: true, ref: false });
+  worker.addEventListener("message", ({ data }) => { if (data.type === "test-locked") locked.resolve(); });
+  return worker;
+});
+database.query("INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at) VALUES ('bot','Synthetic','codex',?,1,1)").run(directory);
+database.exec("INSERT INTO threads(id,bot_id,title,created_at,updated_at) VALUES ('thread','bot','Synthetic',1,1)");
+const store = runtime.kernel.services.use("store.api");
+store.insertMessage({ message: {
+  id: "request", threadId: "thread", parentId: null, role: "user", kind: "text", status: "complete", runId: null,
+  text: "Synthetic request", parts: [], sender: null, source: "local",
+} });
+const turn = Promise.withResolvers();
+let abortObserved = false;
+const engine = createRuntimeEngine({ kernel: runtime.kernel, environment: { HOME: directory, PATH: "/usr/bin" }, providerAdapters: {
+  codex: { provider: "codex", detect: async () => ({ success: true, path: "/tmp/fixture-provider", version: "1", loggedIn: true }),
+    startTurn: async (args) => {
+      args.onEvent({ type: "turn_started", externalTurnId: "synthetic-turn" });
+      turn.resolve(args);
+      await new Promise((resolve) => args.signal.addEventListener("abort", resolve, { once: true }));
+      abortObserved = true;
+      return { success: false, errorCode: "canceled", error: "Canceled" };
+    }, answerApproval: async () => ({ success: true }), shutdown: async () => {},
+  },
+} });
+const queued = engine.enqueue({ threadId: "thread", requestMessageId: "request", trigger: "user" });
+if (!queued.success) throw new Error("Could not start synthetic turn");
+const args = await turn.promise;
+library.symbols.touri_start_sync_recording();
+let cancelLatencyMs = 0;
+let mainWriteLatencyMs = 0;
+const after = await measure(async () => {
+  args.onEvent({ type: "text_delta", itemId: "text", delta: "x".repeat(32) });
+  const drained = store.flushWritesAsync();
+  await locked.promise;
+  const writeStartedAt = performance.now();
+  const mainWrite = writeDatabaseAsync(database, () => database.query(
+    "INSERT INTO settings(key,value_json,updated_at) VALUES ('synthetic.concurrent','true',1)",
+  ).run()).then(() => { mainWriteLatencyMs = Math.round(performance.now() - writeStartedAt); });
+  const cancelStartedAt = performance.now();
+  engine.cancel(queued.run.id);
+  cancelLatencyMs = Math.round(performance.now() - cancelStartedAt);
+  await Promise.all([drained, mainWrite]);
+  const deadline = performance.now() + 5000;
+  while (engine.listRuns("thread")[0]?.status !== "canceled") {
+    if (performance.now() > deadline) throw new Error("Cancellation did not settle");
+    await Bun.sleep(5);
+  }
+  await store.flushWritesAsync();
+});
+after.syncCalls = library.symbols.touri_stop_sync_recording();
+after.cancelLatencyMs = cancelLatencyMs;
+after.mainWriteLatencyMs = mainWriteLatencyMs;
+after.abortObserved = abortObserved;
+after.mainWrite = database.query("SELECT value_json FROM settings WHERE key='synthetic.concurrent'").get().value_json;
+after.text = store.activePath({ threadId: "thread" }).find((message) => message.role === "assistant").text;
+after.journalRows = database.query("SELECT COUNT(*) AS count FROM transcript_entries WHERE json_extract(event_json,'$.type')='message.delta'").get().count;
+await engine.shutdown();
+await runtime.stop();
+workerUrls.forEach((url) => URL.revokeObjectURL(url));
+console.log(JSON.stringify({ delayMs: 200, before, after }));
 `
 
 test.skipIf(!canRunSyncBenchmark)(
@@ -304,7 +275,6 @@ test.skipIf(!canRunSyncBenchmark)(
     const shimPath = join(root, "slow-sync.so")
     const beforePath = join(root, "before.db")
     const afterPath = join(root, "after.db")
-    const authPath = join(root, "auth.db")
     await writeFile(sourcePath, syncShim)
     if (!compilerPath) throw new Error("A C compiler is required for the sync benchmark")
     for (const filename of [beforePath, afterPath]) getStreamBenchmarkDatabase(filename)
@@ -325,10 +295,13 @@ test.skipIf(!canRunSyncBenchmark)(
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         TMPDIR: root,
         TOURI_AFTER_DB: afterPath,
-        TOURI_AUTH_DB: authPath,
-        TOURI_AUTH_STORE: fileURLToPath(new URL("../../src/cli/auth/store.ts", import.meta.url)),
+        TOURI_BENCH_DIR: root,
+        TOURI_KERNEL: fileURLToPath(new URL("../../src/kernel/index.ts", import.meta.url)),
+        TOURI_STORE: fileURLToPath(new URL("../../src/store/index.ts", import.meta.url)),
+        TOURI_ENGINE: fileURLToPath(new URL("../../src/runtime/engine.ts", import.meta.url)),
+        TOURI_DATABASE_WRITE: fileURLToPath(new URL("../../src/kernel/database-write.ts", import.meta.url)),
         TOURI_BEFORE_DB: beforePath,
-        TOURI_STREAM_WORKER: streamPersistenceWorkerSource,
+        TOURI_STREAM_WORKER: fileURLToPath(new URL("../../src/store/stream-persistence-worker.ts", import.meta.url)),
         TOURI_SYNC_SHIM: shimPath,
       },
       stdout: "pipe",
@@ -340,44 +313,33 @@ test.skipIf(!canRunSyncBenchmark)(
       new Response(child.stderr).text(),
     ])
     if (childExit !== 0) throw new Error(`The stream sync benchmark failed: ${childError}`)
-    const measured = JSON.parse(output) as {
-      before: { syncCalls: number; batchLatencyMs: number; eventLoopLagMs: number }
-      beforeCheckpoint: { syncCalls: number; batchLatencyMs: number; eventLoopLagMs: number }
-      auth: { syncCalls: number; batchLatencyMs: number; eventLoopLagMs: number }
+    const measured = JSON.parse(output.trim().split("\n").at(-1) ?? "{}") as {
+      before: { syncCalls: number; latencyMs: number; maxLagMs: number; samples: number }
       after: {
-        batchLatencyMs: number
-        batchEventLoopLagMs: number
-        batchSyncCalls: number
-        checkpointLatencyMs: number
-        checkpointEventLoopLagMs: number
-        checkpointSyncCalls: number
-        cancellationObserved: boolean
+        latencyMs: number
+        maxLagMs: number
+        samples: number
+        syncCalls: number
+        cancelLatencyMs: number
+        mainWriteLatencyMs: number
+        mainWrite: string
+        abortObserved: boolean
         journalRows: number
         text: string
       }
-      afterCheckpoint: { syncCalls: number; batchLatencyMs: number; eventLoopLagMs: number }
     }
-    console.info(`stream-sync-benchmark ${JSON.stringify({ delayMs: 200, ...measured })}`)
+    console.info(`stream-sync-benchmark ${JSON.stringify(measured)}`)
 
     expect(measured.before.syncCalls).toBeGreaterThanOrEqual(1)
-    expect(measured.before.eventLoopLagMs).toBeGreaterThan(100)
-    expect(measured.beforeCheckpoint.syncCalls).toBeGreaterThanOrEqual(1)
-    expect(measured.beforeCheckpoint.batchLatencyMs).toBeGreaterThan(100)
-    expect(measured.beforeCheckpoint.eventLoopLagMs).toBeGreaterThan(100)
-    expect(measured.auth.syncCalls).toBeGreaterThanOrEqual(2)
-    expect(measured.auth.batchLatencyMs).toBeGreaterThan(100)
-    expect(measured.auth.eventLoopLagMs).toBeGreaterThan(100)
-    expect(measured.after.batchSyncCalls).toBeGreaterThanOrEqual(1)
-    expect(measured.after.batchLatencyMs).toBeGreaterThan(100)
-    expect(measured.after.batchEventLoopLagMs).toBeLessThan(50)
-    expect(measured.after.checkpointSyncCalls).toBeGreaterThanOrEqual(1)
-    expect(measured.after.checkpointLatencyMs).toBeGreaterThan(100)
-    expect(measured.after.checkpointEventLoopLagMs).toBeLessThan(50)
-    expect(measured.afterCheckpoint.syncCalls).toBeGreaterThanOrEqual(1)
-    expect(measured.afterCheckpoint.batchLatencyMs).toBeGreaterThan(100)
-    expect(measured.afterCheckpoint.eventLoopLagMs).toBeLessThan(50)
-    expect(measured.after.cancellationObserved).toBe(true)
-    expect(measured.after.journalRows).toBe(32)
+    expect(measured.before.maxLagMs).toBeGreaterThan(100)
+    expect(measured.after.latencyMs).toBeGreaterThan(200)
+    expect(measured.after.samples).toBeGreaterThan(10)
+    expect(measured.after.maxLagMs).toBeLessThan(50)
+    expect(measured.after.cancelLatencyMs).toBeLessThan(50)
+    expect(measured.after.mainWriteLatencyMs).toBeGreaterThan(100)
+    expect(measured.after.mainWrite).toBe("true")
+    expect(measured.after.abortObserved).toBe(true)
+    expect(measured.after.journalRows).toBe(1)
     expect(measured.after.text).toBe("x".repeat(32))
   },
   15_000,

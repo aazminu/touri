@@ -1,9 +1,10 @@
-import { Database } from "bun:sqlite"
 import { afterEach, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { UiEvent } from "@touri/contracts"
 import { openDatabase } from "../../src/kernel/db"
+import { createStreamPersistence, STREAM_PERSISTENCE_LIMITS } from "../../src/store/stream-persistence"
 import { streamPersistenceWorkerSource } from "../../src/store/stream-persistence-worker"
 
 const cleanups = new Set<() => void | Promise<void>>()
@@ -13,102 +14,218 @@ afterEach(async () => {
   cleanups.clear()
 })
 
-test("a restarted worker replays a committed batch without duplicating its journal or event", async () => {
+const getFixture = async (createWorker?: (url: string) => Worker) => {
   const root = await mkdtemp(join(tmpdir(), "touri-stream-persistence-"))
   cleanups.add(() => rm(root, { recursive: true, force: true }))
-  const filename = join(root, "touri.db")
-  const database = openDatabase({ filename })
-  const databasePath = database.filename
-  database
-    .query(
-      "INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at) VALUES ('bot','Synthetic','codex','.',1,1)",
-    )
-    .run()
-  database
-    .query("INSERT INTO threads(id,bot_id,title,created_at,updated_at) VALUES ('thread','bot','Synthetic',1,1)")
-    .run()
-  database
-    .query(`INSERT INTO messages(id,thread_id,role,kind,status,text,parts_json,created_at,updated_at)
-      VALUES ('reply','thread','assistant','text','streaming','','[{"type":"text","text":""}]',1,1)`)
-    .run()
-  database.close()
-  const batch = {
-    id: "stable-batch",
-    events: [
-      {
-        type: "message.delta",
-        threadId: "thread",
-        messageId: "reply",
-        partIndex: 0,
-        partType: "text",
-        delta: "durable",
-        offset: 0,
-        generation: 1,
-        updatedAt: 2,
-      },
-    ],
-  }
+  const database = openDatabase({ filename: join(root, "touri.db") })
+  cleanups.add(() => database.close())
+  database.exec(`INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at)
+    VALUES ('bot','Synthetic','codex','.',1,1);
+    INSERT INTO threads(id,bot_id,title,created_at,updated_at) VALUES ('thread','bot','Synthetic',1,1);
+    INSERT INTO threads(id,bot_id,title,created_at,updated_at) VALUES ('other','bot','Synthetic',1,1)`)
+  const threadIds = ["thread", "other"]
+  threadIds.forEach((threadId) => {
+    database
+      .query(`INSERT INTO messages(id,thread_id,role,kind,status,text,parts_json,created_at,updated_at)
+      VALUES ('reply',?,'assistant','text','streaming','','[{"type":"text","text":""}]',1,1)`)
+      .run(threadId)
+  })
+  const published: UiEvent[] = []
+  const errors: number[] = []
+  const persistence = createStreamPersistence({
+    database,
+    publish: (event) => published.push(event),
+    onError: () => errors.push(Date.now()),
+    ...(createWorker ? { createWorker } : {}),
+  })
+  cleanups.add(() => persistence.close())
+  return { database, persistence, published, errors }
+}
 
-  await persistBatch({ filename: databasePath, batch })
-  await persistBatch({ filename: databasePath, batch })
-
-  const recovered = new Database(databasePath, { readonly: true })
-  cleanups.add(() => recovered.close())
-  const journalRows = recovered
-    .query("SELECT COUNT(*) AS count FROM transcript_entries WHERE json_extract(event_json,'$.type')='message.delta'")
-    .get() as { count: number }
-  const eventRows = recovered
-    .query("SELECT COUNT(*) AS count FROM ui_event_log WHERE json_extract(event_json,'$.type')='message.delta'")
-    .get() as { count: number }
-  const projection = recovered.query("SELECT text FROM messages WHERE id = 'reply'").get()
-  expect(journalRows).toEqual({ count: 1 })
-  expect(eventRows).toEqual({ count: 1 })
-  expect(projection).toEqual({ text: "durable" })
+const getDelta = (threadId = "thread", delta = "durable") => ({
+  type: "message.delta" as const,
+  threadId,
+  messageId: "reply",
+  partIndex: 0,
+  partType: "text" as const,
+  delta,
+  offset: 0,
+  generation: 1,
+  updatedAt: 2,
 })
 
-const persistBatch = async ({ filename, batch }: { filename: string; batch: unknown }): Promise<void> => {
-  const workerUrl = URL.createObjectURL(new Blob([streamPersistenceWorkerSource], { type: "application/javascript" }))
-  const worker = new Worker(workerUrl, { smol: true, ref: false })
-  try {
-    await new Promise<void>((resolve, reject) => {
-      let committed = false
-      let terminating = false
-      let startupRetries = 0
-      worker.onmessage = ({
-        data,
-      }: MessageEvent<{ type?: string; batch?: unknown; busy?: boolean; code?: string }>): void => {
-        if (data.type === "ready") {
-          worker.postMessage({ type: "batch", batch })
-          return
-        }
-        if (data.type === "committed") {
-          committed = true
-          terminating = true
-          worker.terminate()
-          return
-        }
-        if (data.type === "startup-error" && data.busy && startupRetries < 5) {
-          startupRetries += 1
-          setTimeout(() => worker.postMessage({ type: "start", filename }), 100)
-          return
-        }
-        reject(
-          new Error(
-            `Stream persistence worker failed: ${data.type ?? "unknown message"}${data.busy ? " (busy)" : ""}${data.code ? ` ${data.code}` : ""}`,
-          ),
-        )
-      }
-      worker.addEventListener("close", () => {
-        if (committed && terminating) resolve()
-      })
-      worker.onerror = (event): void => {
-        if (terminating) return
-        reject(new Error(`Stream persistence worker failed: ${event.message || "worker error"}`))
-      }
-      worker.postMessage({ type: "start", filename })
-    })
-  } finally {
+const createSourceWorker = (source: string): Worker => {
+  const url = URL.createObjectURL(new Blob([source], { type: "application/javascript" }))
+  const worker = new Worker(url, { smol: true, ref: false })
+  cleanups.add(() => {
     worker.terminate()
-    URL.revokeObjectURL(workerUrl)
-  }
+    URL.revokeObjectURL(url)
+  })
+  return worker
 }
+
+test("the controller retries a worker lost after commit and publishes exactly once from journal references", async () => {
+  let starts = 0
+  const f = await getFixture(() => {
+    starts += 1
+    const source =
+      starts === 1
+        ? streamPersistenceWorkerSource.replace("self.postMessage(result);", "self.close();")
+        : streamPersistenceWorkerSource
+    return createSourceWorker(source)
+  })
+
+  await f.persistence.submit([getDelta()])
+
+  expect(starts).toBe(2)
+  expect(f.published.filter((event) => event.type === "message.delta")).toHaveLength(1)
+  expect(f.database.query("SELECT text FROM messages WHERE thread_id='thread'").get()).toEqual({ text: "durable" })
+  expect(
+    f.database
+      .query("SELECT COUNT(*) AS n FROM transcript_entries WHERE json_extract(event_json,'$.type')='message.delta'")
+      .get(),
+  ).toEqual({ n: 1 })
+  expect(
+    f.database
+      .query("SELECT COUNT(*) AS n FROM ui_event_log WHERE json_extract(event_json,'$.type')='message.delta'")
+      .get(),
+  ).toEqual({ n: 1 })
+  const saved = f.database.query("SELECT result_json FROM stream_writer_state").get() as { result_json: string }
+  expect(JSON.parse(saved.result_json)).toEqual({ entryIds: [expect.any(Number)] })
+  expect(saved.result_json).not.toContain("durable")
+})
+
+test("the controller retries a worker killed inside its transaction after rollback", async () => {
+  let starts = 0
+  let observedUncommitted = false
+  const f = await getFixture(() => {
+    starts += 1
+    if (starts !== 1) return createSourceWorker(streamPersistenceWorkerSource)
+    const source = streamPersistenceWorkerSource.replace(
+      "database.transaction(() => writeBatch(data.batch)).immediate()",
+      `database.transaction(() => {
+        const result = writeBatch(data.batch);
+        self.postMessage({ type: "test-transaction" });
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
+        return result;
+      }).immediate()`,
+    )
+    const worker = createSourceWorker(source)
+    worker.addEventListener("message", ({ data }) => {
+      if (data.type !== "test-transaction") return
+      observedUncommitted =
+        (f.database.query("SELECT text FROM messages WHERE thread_id='thread'").get() as { text: string }).text === ""
+      worker.terminate()
+    })
+    return worker
+  })
+
+  await f.persistence.submit([getDelta()])
+
+  expect(observedUncommitted).toBe(true)
+  expect(starts).toBe(2)
+  expect(f.published.filter((event) => event.type === "message.delta")).toHaveLength(1)
+  expect(f.database.query("SELECT text FROM messages WHERE thread_id='thread'").get()).toEqual({ text: "durable" })
+  expect(
+    f.database
+      .query("SELECT COUNT(*) AS n FROM transcript_entries WHERE json_extract(event_json,'$.type')='message.delta'")
+      .get(),
+  ).toEqual({ n: 1 })
+})
+
+test("a permanent batch error backs off, records a rejection and lets another thread commit", async () => {
+  const attempts: number[] = []
+  const f = await getFixture(() => {
+    const worker = createSourceWorker(streamPersistenceWorkerSource)
+    worker.addEventListener("message", ({ data }) => {
+      if (data.type === "batch-error") attempts.push(performance.now())
+    })
+    return worker
+  })
+  await f.persistence.ready
+  f.database.exec(`CREATE TRIGGER fail_stream BEFORE INSERT ON transcript_entries
+    WHEN NEW.thread_id = 'thread' AND json_extract(NEW.event_json,'$.type') = 'message.delta'
+    BEGIN SELECT RAISE(ABORT, 'Synthetic permanent failure'); END`)
+
+  const poison = f.persistence.submit([getDelta()])
+  const healthy = f.persistence.submit([getDelta("other")])
+  const [rejected, committed] = await Promise.all([poison, healthy])
+
+  expect(attempts).toHaveLength(4)
+  expect((attempts[1] ?? 0) - (attempts[0] ?? 0)).toBeGreaterThanOrEqual(80)
+  expect((attempts[2] ?? 0) - (attempts[1] ?? 0)).toBeGreaterThanOrEqual(180)
+  expect(rejected.events).toHaveLength(0)
+  expect(rejected.rejected).toHaveLength(1)
+  expect(committed.events).toHaveLength(1)
+  expect(f.database.query("SELECT text FROM messages WHERE thread_id='other'").get()).toEqual({ text: "durable" })
+  expect(f.errors).toHaveLength(1)
+})
+
+test("startup materialization failure has a finite retry budget and rejects buffered work with resync", async () => {
+  let starts = 0
+  const f = await getFixture(() => {
+    starts += 1
+    return createSourceWorker(
+      streamPersistenceWorkerSource.replace(
+        "        materialize();",
+        '        throw new Error("Synthetic materialization failure");',
+      ),
+    )
+  })
+
+  await expect(f.persistence.submit([getDelta()])).rejects.toThrow("could not start")
+  await f.persistence.ready
+
+  expect(starts).toBe(4)
+  expect(f.errors).toHaveLength(1)
+  expect(f.published).toEqual([{ type: "transcript.resync" }])
+  await expect(f.persistence.submit([getDelta("other")])).rejects.toThrow("could not start")
+})
+
+test.each(["bytes", "events"] as const)(
+  "worker downtime cannot grow buffered %s beyond admission limits",
+  async (limit) => {
+    const f = await getFixture(() => {
+      throw new Error("Synthetic startup failure")
+    })
+    const event = getDelta("thread", limit === "bytes" ? "x".repeat(64 * 1024) : "x")
+    const count = limit === "bytes" ? 140 : STREAM_PERSISTENCE_LIMITS.events + 1
+    const writes = Array.from({ length: count }, () =>
+      f.persistence.submit([event]).catch((error: Error) => error.message),
+    )
+
+    const results = await Promise.all(writes)
+
+    const overflow = results.filter((result) => typeof result === "string" && result.includes("buffer limit"))
+    expect(overflow.length).toBeGreaterThan(0)
+    expect(results.filter((result) => result === "Stream persistence could not start").length).toBeLessThanOrEqual(
+      STREAM_PERSISTENCE_LIMITS.events,
+    )
+    expect(f.errors).toHaveLength(1)
+  },
+)
+
+test("the worker uses NORMAL, a bounded cache and no automatic checkpoints", async () => {
+  const pragmas = Promise.withResolvers<{ synchronous: number; cache: number; autocheckpoint: number }>()
+  const f = await getFixture(() => {
+    const source = streamPersistenceWorkerSource.replace(
+      'self.postMessage({ type: "ready" });',
+      `
+      self.postMessage({ type: "test-pragmas",
+        synchronous: database.query("PRAGMA synchronous").get().synchronous,
+        cache: database.query("PRAGMA cache_size").get().cache_size,
+        autocheckpoint: database.query("PRAGMA wal_autocheckpoint").get().wal_autocheckpoint });
+      self.postMessage({ type: "ready" });`,
+    )
+    const worker = createSourceWorker(source)
+    worker.addEventListener("message", ({ data }) => {
+      if (data.type === "test-pragmas") pragmas.resolve(data)
+    })
+    return worker
+  })
+
+  await f.persistence.ready
+  const measured = await pragmas.promise
+
+  expect(measured).toMatchObject({ synchronous: 1, cache: -65536, autocheckpoint: 0 })
+})

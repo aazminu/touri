@@ -209,9 +209,27 @@ const eventProjection = (event, cache) => {
   return projection;
 };
 
+const getBatchResult = (id, entryIds) => {
+  const published = entryIds.map((entryId) => {
+    const row = database.query("SELECT event_json FROM transcript_entries WHERE id = ?").get(entryId);
+    if (!row) throw new Error("Stream batch journal entry is missing");
+    return JSON.parse(row.event_json);
+  });
+  return {
+    type: "committed", id,
+    events: published.filter((event) => event.type === "message.delta" || event.type === "message.parts"),
+    rejected: published.filter((event) => event.type === "transcript.rejected"),
+    published,
+  };
+};
+
 const writeBatch = (batch) => {
   const previous = database.query("SELECT batch_id, result_json FROM stream_writer_state WHERE id = 1").get();
-  if (previous?.batch_id === batch.id) return JSON.parse(previous.result_json);
+  if (previous?.batch_id === batch.id) {
+    const saved = JSON.parse(previous.result_json);
+    return getBatchResult(batch.id, saved.entryIds);
+  }
+  const firstEntryId = database.query("SELECT COALESCE(MAX(id), 0) AS id FROM transcript_entries").get().id;
   // Batch projections stay local and mutable so one transaction can rebase provider chunks in order.
   const committed = [];
   const rejected = [];
@@ -225,17 +243,17 @@ const writeBatch = (batch) => {
       messageId: event.messageId,
     });
   }
-  for (const target of targets.values()) materialize(target);
+  if (!batch.quarantine) for (const target of targets.values()) materialize(target);
   for (const event of batch.events) {
-    if (event.type === "stream.rejection") {
-      const rejection = recordRejection(event, event.reason);
+    if (event.type === "stream.rejection" || batch.quarantine) {
+      const rejection = recordRejection(event, event.type === "stream.rejection" ? event.reason : "validation");
       rejected.push(rejection);
       published.push(rejection);
       continue;
     }
     const thread = database.query("SELECT generation, updated_seq FROM threads WHERE id = ?")
       .get(event.threadId);
-    const head = database.query("SELECT status, run_id FROM messages WHERE thread_id = ? AND id = ?")
+    const head = database.query("SELECT status, run_id, updated_seq FROM messages WHERE thread_id = ? AND id = ?")
       .get(event.threadId, event.messageId);
     const run = head?.run_id
       ? database.query("SELECT status, thread_id FROM runs WHERE id = ?").get(head.run_id)
@@ -249,6 +267,17 @@ const writeBatch = (batch) => {
       }
       continue;
     }
+    const snapshot = event.snapshotSeq !== undefined && head.updated_seq > event.snapshotSeq
+      ? database.query("SELECT event_json FROM transcript_entries WHERE thread_id = ? AND seq = ?")
+          .get(event.threadId, head.updated_seq)
+      : null;
+    if (snapshot && ["message.created", "message.updated"].includes(JSON.parse(snapshot.event_json).type)) {
+      const rejection = recordRejection(event, "seq_conflict");
+      rejected.push(rejection);
+      published.push(rejection);
+      continue;
+    }
+    delete event.snapshotSeq;
     if (event.type === "message.delta" && event.expectedSeq !== undefined && event.expectedSeq !== thread.updated_seq) {
       const rejection = recordRejection(event, "seq_conflict");
       rejected.push(rejection);
@@ -332,10 +361,12 @@ const writeBatch = (batch) => {
     published.push(event);
   }
   capture();
-  for (const target of targets.values()) materialize(target);
+  if (!batch.quarantine) for (const target of targets.values()) materialize(target);
   const result = { type: "committed", id: batch.id, events: committed, rejected, published };
   database.query("UPDATE stream_writer_state SET batch_id = ?, result_json = ? WHERE id = 1")
-    .run(batch.id, JSON.stringify(result));
+    .run(batch.id, JSON.stringify({ entryIds: database.query(
+      "SELECT id FROM transcript_entries WHERE id > ? ORDER BY id",
+    ).all(firstEntryId).map((entry) => entry.id) }));
   return result;
 };
 
@@ -351,12 +382,11 @@ self.onmessage = ({ data }) => {
   if (data.type === "start") {
     try {
       database = new Database(data.filename, sqliteFlags.SQLITE_OPEN_READWRITE | sqliteFlags.SQLITE_OPEN_NOFOLLOW);
-      const synchronous = data.synchronous === "FULL" ? "FULL" : "NORMAL";
-      database.exec("PRAGMA busy_timeout = 0; PRAGMA journal_mode = WAL; PRAGMA synchronous = " + synchronous + "; PRAGMA foreign_keys = ON");
+      database.exec("PRAGMA busy_timeout = 0; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA wal_autocheckpoint = 0; PRAGMA cache_size = -65536");
       database.transaction(() => {
         capture();
         materialize();
-      })();
+      }).immediate();
       self.postMessage({ type: "ready" });
     } catch (error) {
       self.postMessage({
@@ -368,18 +398,9 @@ self.onmessage = ({ data }) => {
     return;
   }
   if (stopped || !database) return;
-  if (data.type === "checkpoint") {
-    try {
-      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-      self.postMessage({ type: "checkpointed" });
-    } catch {
-      self.postMessage({ type: "checkpoint-error" });
-    }
-    return;
-  }
   if (data.type !== "batch") return;
   try {
-    const result = database.transaction(() => writeBatch(data.batch))();
+    const result = database.transaction(() => writeBatch(data.batch)).immediate();
     self.postMessage(result);
   } catch (error) {
     self.postMessage({ type: "batch-error", id: data.batch.id, busy: isBusy(error) });

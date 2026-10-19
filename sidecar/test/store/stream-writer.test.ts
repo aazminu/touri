@@ -13,15 +13,16 @@ import { profileProviders } from "../../src/kernel/provider-profiles"
 import { compactTranscript, materializeTranscript } from "../../src/kernel/transcript-storage"
 import { createRuntimePersistence } from "../../src/runtime/persistence"
 import { init as initStore } from "../../src/store"
+import { streamPersistenceWorkerSource } from "../../src/store/stream-persistence-worker"
 import { STREAM_WRITE_LIMITS } from "../../src/store/stream-writer"
 import { readWorkspaceActivity } from "../../src/store/workspace-activity"
 
 const MAX_STREAM_EVENTS_PER_WRITE = STREAM_WRITE_LIMITS.batchEvents
 
-const fixture = async (runStage?: PerformanceStageRunner) => {
+const fixture = async (runStage?: PerformanceStageRunner, createWorker?: (url: string) => Worker) => {
   const root = mkdtempSync(join(tmpdir(), "touri-stream-writer-"))
   const runtime = createKernel({ appData: root })
-  await initStore(runtime.kernel, runStage)
+  await initStore(runtime.kernel, runStage, createWorker)
   const database = runtime.kernel.db as Database
   database
     .query("INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at) VALUES ('b','Teste',?,'/tmp',1,1)")
@@ -63,7 +64,7 @@ const fixture = async (runStage?: PerformanceStageRunner) => {
 const cleanups = new Set<() => void | Promise<void>>()
 
 afterEach(async () => {
-  for (const cleanup of cleanups) await cleanup()
+  for (const cleanup of Array.from(cleanups).reverse()) await cleanup()
   cleanups.clear()
 })
 
@@ -595,7 +596,7 @@ test("stream writes retry a busy database without waiting on the main loop", asy
       delta: "x".repeat(STREAM_WRITE_LIMITS.bytes),
     }),
   ).not.toThrow()
-  expect((f.database.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(5_000)
+  expect((f.database.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(10)
   expect(f.events.filter(({ event }) => event.type === "message.delta")).toHaveLength(0)
   await Bun.sleep(30)
   expect(timerFired).toBe(true)
@@ -744,4 +745,108 @@ test("large WAL stream batches preserve ordered journal entries", async () => {
     .all() as Array<{ message_id: string; seq: number }>
   expect(rows).toHaveLength(100)
   expect(rows.map(({ message_id }) => message_id)).toEqual(Array.from({ length: 100 }, (_, index) => `stream-${index}`))
+})
+
+test("drain waits for its watermark while another stream keeps accepting events", async () => {
+  const url = URL.createObjectURL(
+    new Blob(
+      [
+        streamPersistenceWorkerSource.replace(
+          "const result = database.transaction(() => writeBatch(data.batch)).immediate();",
+          `const result = database.transaction(() => {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+      return writeBatch(data.batch);
+    }).immediate();`,
+        ),
+      ],
+      { type: "application/javascript" },
+    ),
+  )
+  cleanups.add(() => URL.revokeObjectURL(url))
+  const f = await fixture(undefined, () => new Worker(url, { smol: true, ref: false }))
+  cleanups.add(f.close)
+  Array.from({ length: 8 }).forEach(() => {
+    f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "x".repeat(8192) })
+  })
+  const timer = setInterval(
+    () => f.store.appendDelta({ threadId: "t", messageId: "b", partIndex: 0, delta: "y".repeat(8192) }),
+    5,
+  )
+  cleanups.add(() => clearInterval(timer))
+  const started = performance.now()
+  const deadline = setTimeout(() => clearInterval(timer), 1000)
+  cleanups.add(() => clearTimeout(deadline))
+
+  await f.store.flushWritesAsync?.()
+  const elapsedMs = performance.now() - started
+  clearInterval(timer)
+
+  expect(elapsedMs).toBeLessThan(750)
+  expect(f.database.query("SELECT text FROM messages WHERE id='a'").get()).toEqual({ text: "x".repeat(8 * 8192) })
+  await f.store.flushWritesAsync?.()
+})
+
+test.each(["parts", "text", "status"] as const)(
+  "synchronous %s snapshots supersede queued deltas without loss or duplication",
+  async (field) => {
+    const f = await fixture()
+    cleanups.add(f.close)
+    f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "preservado" })
+    const patch =
+      field === "status"
+        ? { status: "complete" as const }
+        : field === "parts"
+          ? { parts: [{ type: "text" as const, text: "preservado" }] }
+          : { text: "substituído", parts: [{ type: "text" as const, text: "substituído" }] }
+
+    expect(f.store.updateMessage({ threadId: "t", messageId: "a", patch }).success).toBe(true)
+    await f.store.flushWritesAsync?.()
+
+    const text = field === "text" ? "substituído" : "preservado"
+    expect(f.database.query("SELECT text,parts_json FROM messages WHERE id='a'").get()).toEqual({
+      text,
+      parts_json: JSON.stringify([{ type: "text", text }]),
+    })
+  },
+)
+
+test("a synchronous replacement also fences a batch already submitted to the worker", async () => {
+  const f = await fixture()
+  cleanups.add(f.close)
+  f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "x".repeat(8192) })
+
+  f.store.updateMessage({
+    threadId: "t",
+    messageId: "a",
+    patch: { text: "snapshot", parts: [{ type: "text", text: "snapshot" }] },
+  })
+  await f.store.flushWritesAsync?.()
+  f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: " novo" })
+  await f.store.flushWritesAsync?.()
+
+  expect(f.database.query("SELECT text FROM messages WHERE id='a'").get()).toEqual({ text: "snapshot novo" })
+})
+
+test("a stopped worker cannot grow writer buffers or projections past the byte limit", async () => {
+  const f = await fixture()
+  cleanups.add(f.close)
+  const blocker = new SqliteDatabase(join(f.root, "touri.db"))
+  cleanups.add(() => blocker.close())
+  blocker.exec("BEGIN IMMEDIATE")
+  const input = { threadId: "t", messageId: "a", partIndex: 0, delta: "x".repeat(256 * 1024) }
+  const accepted = Array.from({ length: 40 }).reduce<number>((count) => {
+    try {
+      f.store.appendDelta(input)
+      return count + 1
+    } catch (error) {
+      expect(String(error)).toContain("buffer limit")
+      return count
+    }
+  }, 0)
+
+  expect(accepted).toBeGreaterThan(0)
+  expect(accepted * Buffer.byteLength(input.delta)).toBeLessThanOrEqual(STREAM_WRITE_LIMITS.pendingBytes)
+  expect(f.store.activePath({ threadId: "t", leafId: "a" })[0]?.text.length).toBe(accepted * input.delta.length)
+  blocker.exec("ROLLBACK")
+  await f.store.flushWritesAsync?.()
 })

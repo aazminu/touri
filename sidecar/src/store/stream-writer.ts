@@ -10,11 +10,13 @@ export const STREAM_WRITE_LIMITS = {
   bytes: 8 * 1024,
   batchBytes: 64 * 1024,
   batchEvents: 64,
+  pendingBytes: 8 * 1024 * 1024,
+  pendingEvents: 4_096,
 }
 type Delta = Extract<UiEvent, { type: "message.delta" }>
 type Parts = Extract<UiEvent, { type: "message.parts" }>
-type PendingDelta = Delta & { expectedSeq?: number }
-type PendingStreamEvent = PendingDelta | Parts
+type PendingDelta = Delta & { expectedSeq?: number; snapshotSeq?: number }
+type PendingStreamEvent = PendingDelta | (Parts & { snapshotSeq?: number })
 type PendingEvent = PendingStreamEvent | RejectionWrite
 type Projection = {
   message: Message
@@ -27,7 +29,7 @@ type Projection = {
 const getEventBytes = (event: PendingEvent): number => {
   if (event.type === "message.delta") return Buffer.byteLength(event.delta)
   if (event.type === "message.parts") return Buffer.byteLength(JSON.stringify(event.parts))
-  return 0
+  return 256
 }
 
 const isSnapshotCovered = (projection: Projection, seq: number | undefined): boolean =>
@@ -67,6 +69,7 @@ export const createStreamWriter = ({
   getThread,
   runStage,
   getNow = Date.now,
+  createWorker,
 }: {
   kernel: Kernel
   database: Database
@@ -74,6 +77,7 @@ export const createStreamWriter = ({
   getThread: (input: { threadId: string }) => Thread | null
   runStage?: PerformanceStageRunner
   getNow?: () => number
+  createWorker?: (url: string) => Worker
 }) => {
   // Stream buffers mutate locally so provider chunks stay append-only and bounded.
   let pending: PendingEvent[] = []
@@ -85,19 +89,41 @@ export const createStreamWriter = ({
   const lastByMessage = new Map<string, PendingStreamEvent>()
   let timer: ReturnType<typeof setTimeout> | null = null
   let flushing = false
+  const failed = new WeakSet<PendingEvent>()
+  let capacityReported = false
   let stopped = false
   const outside = new WeakSet<PendingEvent>()
   const persistence = createStreamPersistence({
     database,
+    ...(createWorker ? { createWorker } : {}),
     publish: (event) => kernel.publish(event),
     onError: () => {
       try {
-        kernel.log({ level: "error", module: "store", msg: "Stream persistence unavailable; retrying buffered writes" })
+        kernel.log({
+          level: "error",
+          module: "store",
+          msg: "Stream persistence unavailable; buffered writes may be rejected",
+        })
       } catch {
         // A full disk can also prevent writing the diagnostic log.
       }
     },
   })
+  const ensureCapacity = (bytes: number, events = 1): void => {
+    const bufferedEvents = pending.length + inFlight.length + events
+    const bufferedBytes = pendingBytes + inFlightBytes + bytes + bufferedEvents * 512
+    if (stopped) throw new Error("Stream writer is closed")
+    if (bufferedBytes <= STREAM_WRITE_LIMITS.pendingBytes && bufferedEvents <= STREAM_WRITE_LIMITS.pendingEvents) return
+    if (!capacityReported) {
+      capacityReported = true
+      try {
+        kernel.log({ level: "error", module: "store", msg: "Stream buffer limit reached; rejecting additional writes" })
+      } catch {
+        // Storage pressure can also prevent writing its diagnostic.
+      }
+    }
+    throw new Error("Stream buffer limit exceeded")
+  }
   const keyOf = (threadId: string, messageId: string): string => JSON.stringify([threadId, messageId])
   const createProjection = (message: Message, baseSeq: number, lastEvent: string | null = null): Projection => ({
     message,
@@ -147,10 +173,10 @@ export const createStreamWriter = ({
     lastByMessage.clear()
     pendingBytes = 0
     for (const event of pending) {
+      pendingBytes += getEventBytes(event)
       if (event.type === "stream.rejection") continue
       const key = keyOf(event.threadId, event.messageId)
       const bytes = getEventBytes(event)
-      pendingBytes += bytes
       runBytes.set(key, (runBytes.get(key) ?? 0) + bytes)
       lastByMessage.set(key, event)
     }
@@ -223,11 +249,18 @@ export const createStreamWriter = ({
         inFlight = []
         inFlightBytes = 0
         for (const event of eligible) projections.delete(keyOf(event.threadId, event.messageId))
-        pending = [...eligible, ...pending]
-        rebuildQueueState()
+        eligible.forEach((event) => {
+          failed.add(event)
+        })
+        try {
+          kernel.publish({ type: "transcript.resync" })
+        } catch {
+          // A failed subscriber cannot restart a quarantined batch.
+        }
       })
       .finally(() => {
         flushing = false
+        if (!pending.length) capacityReported = false
         if (!stopped && pending.length && !timer) timer = setTimeout(flushLater, STREAM_WRITE_LIMITS.delayMs)
       })
   }
@@ -325,6 +358,7 @@ export const createStreamWriter = ({
   }
 
   const queueRejection = (event: RejectionWrite): void => {
+    ensureCapacity(getEventBytes(event))
     if (!database.inTransaction) outside.add(event)
     pending.push(event)
     pendingBytes += getEventBytes(event)
@@ -360,7 +394,9 @@ export const createStreamWriter = ({
     const part = message.parts[input.partIndex]
     if (input.partIndex > message.parts.length || (part && part.type !== "text" && part.type !== "reasoning"))
       return reject("validation")
-    for (const [index, delta] of chunks(input.delta).entries()) {
+    const deltas = chunks(input.delta)
+    ensureCapacity(Buffer.byteLength(input.delta), deltas.length)
+    for (const [index, delta] of deltas.entries()) {
       const buffered = runBytes.get(keyOf(input.threadId, input.messageId)) ?? 0
       if (buffered && buffered + Buffer.byteLength(delta) > STREAM_WRITE_LIMITS.bytes) flush()
       const projection = projectionFor(input.threadId, input.messageId)
@@ -386,6 +422,7 @@ export const createStreamWriter = ({
           partType: type,
           generation: thread.generation ?? 1,
           updatedAt: getNow(),
+          snapshotSeq: projection.baseSeq,
           ...(index === 0 && input.expectedSeq !== undefined ? { expectedSeq: input.expectedSeq } : {}),
         },
         Buffer.byteLength(delta),
@@ -417,6 +454,7 @@ export const createStreamWriter = ({
     // A later invalid patch must not change offsets in the cached projection or
     // externalize an earlier part. Prepare the whole event before applying it.
     validateIndices(current.message.parts.length)
+    ensureCapacity(Buffer.byteLength(JSON.stringify(input.parts)))
     const prepared = input.parts.map(({ partIndex, part }) => ({ partIndex, part: structuredClone(part) }))
     const changesText = prepared.some(
       ({ partIndex, part }) =>
@@ -454,6 +492,7 @@ export const createStreamWriter = ({
       if (current !== preparedProjection) parts = current.writeParts(prepared)
     }
     const bytes = current === preparedProjection ? patchBytes : Buffer.byteLength(JSON.stringify(parts))
+    ensureCapacity(bytes)
     for (const [index, patch] of parts.entries()) {
       current.message.parts[patch.partIndex] = structuredClone(patch.part)
       current.textDeltas.delete(patch.partIndex)
@@ -470,6 +509,7 @@ export const createStreamWriter = ({
         threadId: input.threadId,
         messageId: input.messageId,
         parts,
+        snapshotSeq: current.baseSeq,
         generation: thread.generation ?? 1,
         updatedAt: getNow(),
       },
@@ -494,13 +534,18 @@ export const createStreamWriter = ({
     if (timer) clearTimeout(timer)
     timer = null
     const deadline = stopping ? Date.now() + 2_000 : Number.POSITIVE_INFINITY
-    while ((pending.length || flushing) && Date.now() < deadline) {
+    const watermark = new Set(pending.concat(inFlight))
+    const hasWatermark = (): boolean =>
+      pending.some((event) => watermark.has(event)) || inFlight.some((event) => watermark.has(event))
+    while (hasWatermark() && Date.now() < deadline) {
       if (!flushing) flush()
-      const drained = await persistence.drain({ timeoutMs: Math.max(1, deadline - Date.now()) })
-      if (drained && !pending.length && !flushing) break
-      await new Promise((resolve) => setTimeout(resolve, 20))
+      const remainingMs = Math.min(20, deadline - Date.now())
+      await new Promise((resolve) => setTimeout(resolve, Math.max(1, remainingMs)))
     }
-    if (!stopping) return
+    if (!stopping) {
+      if (Array.from(watermark).some((event) => failed.has(event))) throw new Error("Stream writes were rejected")
+      return
+    }
 
     stopped = true
     if (timer) clearTimeout(timer)
@@ -543,6 +588,8 @@ export const createStreamWriter = ({
     },
     invalidate: (threadId: string, messageId: string): void => {
       projections.delete(keyOf(threadId, messageId))
+      pending = pending.filter((event) => event.threadId !== threadId || event.messageId !== messageId)
+      rebuildQueueState()
     },
     checkpoint: (): void => flush(),
   }

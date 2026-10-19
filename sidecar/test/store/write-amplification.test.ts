@@ -44,8 +44,37 @@ const walMetrics = (path: string): { commits: number; walBytes: number } => {
   }
 }
 
-const totalChanges = (database: Database): number =>
-  (database.query("SELECT total_changes() AS n").get() as { n: number }).n
+// Persistent triggers observe logical row mutations on every SQLite connection, including the worker.
+const recordRowWrites = (database: Database): void => {
+  database.exec(
+    "CREATE TABLE write_measurement (id INTEGER PRIMARY KEY, writes INTEGER NOT NULL); INSERT INTO write_measurement VALUES (1, 0)",
+  )
+  const tables = [
+    "messages",
+    "threads",
+    "transcript_entries",
+    "transcript_part_entries",
+    "transcript_pending_deltas",
+    "transcript_retention",
+    "transcript_maintenance",
+    "ui_event_log",
+    "schema_meta",
+    "stream_writer_state",
+    "tool_resolutions",
+    "tool_calls",
+    "runs",
+    "attachments",
+    "message_search_rows",
+  ]
+  tables.forEach((table) => {
+    ;["INSERT", "UPDATE", "DELETE"].forEach((operation) => {
+      database.exec(`CREATE TRIGGER measure_${table}_${operation} AFTER ${operation} ON ${table}
+        BEGIN UPDATE write_measurement SET writes = writes + 1 WHERE id = 1; END`)
+    })
+  })
+}
+const getRowWrites = (database: Database): number =>
+  (database.query("SELECT writes FROM write_measurement WHERE id = 1").get() as { writes: number }).writes
 
 test("long agentic turns bound durable commits, row mutations and physical WAL bytes", async () => {
   const root = mkdtempSync(join(tmpdir(), "touri-write-amplification-"))
@@ -120,7 +149,8 @@ test("long agentic turns bound durable commits, row mutations and physical WAL b
     })
     await store.flushWritesAsync?.()
     database.exec("PRAGMA wal_autocheckpoint = 0; PRAGMA wal_checkpoint(TRUNCATE)")
-    const changesBefore = totalChanges(database)
+    recordRowWrites(database)
+    const changesBefore = getRowWrites(database)
     const started = performance.now()
     const delta = "Resposta incremental. ".padEnd(64, ".")
     let text = ""
@@ -172,7 +202,7 @@ test("long agentic turns bound durable commits, row mutations and physical WAL b
       deltas: 2_000,
       progressUpdates: progress,
       ...wal,
-      rowWrites: totalChanges(database) - changesBefore,
+      rowWrites: getRowWrites(database) - changesBefore,
       blobBytes,
       bytesWritten: wal.walBytes + blobBytes,
       elapsedMs,
@@ -184,7 +214,8 @@ test("long agentic turns bound durable commits, row mutations and physical WAL b
     expect(reply?.status).toBe("complete")
     if (!baseline) {
       expect(metrics.commits).toBeLessThanOrEqual(350)
-      expect(metrics.rowWrites).toBeLessThanOrEqual(3_500)
+      expect(metrics.rowWrites).toBeGreaterThan(2_000)
+      expect(metrics.rowWrites).toBeLessThanOrEqual(10_000)
       expect(metrics.bytesWritten).toBeLessThanOrEqual(32 * 1024 * 1024)
       expect(metrics.blobBytes).toBe(12 * 1024)
       expect(reply?.parts[1]).toMatchObject({ outputAttachmentId: expect.any(String), outputBytes: 12 * 1024 })

@@ -210,5 +210,7 @@ export const openDatabase = ({ filename }: { filename: string }): Database => {
   database.transaction(() => database.exec(groupDeletionSql))()
   database.transaction(() => database.exec(computerGrantExpirySql))()
   database.transaction(() => database.exec(streamWorkerSql))()
+  // Live writes fail quickly under contention; asynchronous callers can retry after yielding.
+  database.exec("PRAGMA busy_timeout = 10")
   return database
 }

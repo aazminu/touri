@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite"
 import type { Kernel, MessagePart, Run, StoreApi, ToolResolution } from "@touri/contracts"
+import { writeDatabaseAsync } from "../kernel/database-write"
 import { externalizeMessageParts } from "../kernel/output-blobs"
 import { summarizeToolResolutions } from "./tool-resolution-summary"
 
@@ -76,12 +77,17 @@ export const createToolResolutions = (kernel: Kernel) => {
         .run(run.id, part.callId, run.threadId, JSON.stringify(next), resolution, next.resolvedAt ?? null)
     return next
   }
-  const finish = (run: Run, parts: MessagePart[], reason: Exclude<ToolResolution, "running">): MessagePart[] => {
+  const finish = (
+    run: Run,
+    parts: MessagePart[],
+    reason: Exclude<ToolResolution, "running">,
+    persist = true,
+  ): MessagePart[] => {
     const result = parts.map((part) => {
       if (!isTool(part)) return part
-      const current = record(run, part, true)
+      const current = record(run, part, true, persist)
       return outcome(current) === "running"
-        ? record(run, { ...current, resolution: reason, resolvedAt: Date.now() })
+        ? record(run, { ...current, resolution: reason, resolvedAt: Date.now() }, false, persist)
         : current
     })
     const stored = database
@@ -93,21 +99,27 @@ export const createToolResolutions = (kernel: Kernel) => {
       if (included.has(part.callId)) continue
       const resolution = outcome(part)
       result.push(
-        record(run, {
-          ...part,
-          resolution: resolution === "running" ? reason : hasResult(resolution) ? "completed_unobserved" : resolution,
-          ...(part.type === "file_change" && (resolution === "succeeded" || resolution === "failed")
-            ? { completedOutcome: resolution }
-            : {}),
-          resolvedAt: part.resolvedAt ?? Date.now(),
-        }),
+        record(
+          run,
+          {
+            ...part,
+            resolution: resolution === "running" ? reason : hasResult(resolution) ? "completed_unobserved" : resolution,
+            ...(part.type === "file_change" && (resolution === "succeeded" || resolution === "failed")
+              ? { completedOutcome: resolution }
+              : {}),
+            resolvedAt: part.resolvedAt ?? Date.now(),
+          },
+          false,
+          persist,
+        ),
       )
     }
-    database
-      ?.query(
-        "UPDATE tool_calls SET ok = 0, error_code = ?, duration_ms = COALESCE(duration_ms, ? - created_at) WHERE run_id = ? AND ok IS NULL",
-      )
-      .run(reason.toUpperCase(), Date.now(), run.id)
+    if (persist)
+      database
+        ?.query(
+          "UPDATE tool_calls SET ok = 0, error_code = ?, duration_ms = COALESCE(duration_ms, ? - created_at) WHERE run_id = ? AND ok IS NULL",
+        )
+        .run(reason.toUpperCase(), Date.now(), run.id)
     return result
   }
   const clearPending = (runId: string): void => {
@@ -120,47 +132,51 @@ export const createToolResolutions = (kernel: Kernel) => {
 
   const reconcileRun = (store: StoreApi, runId: string): void => {
     if (!database) return
-    database.transaction(() => {
-      const row = database.query(`${PENDING_TOOL_RECOVERY_SQL} AND p.run_id = ?`).get(runId) as RecoveryRun | null
-      if (!row) return
-      // Calls can be persisted before the first assistant message is written.
-      const message = database
-        .query(`SELECT id, parts_json, status FROM messages
+    database
+      .transaction(() => {
+        const row = database.query(`${PENDING_TOOL_RECOVERY_SQL} AND p.run_id = ?`).get(runId) as RecoveryRun | null
+        if (!row) return
+        // Calls can be persisted before the first assistant message is written.
+        const message = database
+          .query(`SELECT id, parts_json, status FROM messages
         WHERE thread_id = ? AND run_id = ? AND role = 'assistant' AND kind = 'text'
         ORDER BY id = ? DESC, created_at DESC LIMIT 1`)
-        .get(row.thread_id, row.id, row.reply_message_id) as {
-        id: string
-        parts_json: string
-        status: string
-      } | null
-      const parts = message ? (JSON.parse(message.parts_json) as MessagePart[]) : []
-      const reason = terminalReason(row.status)
-      const run = { id: row.id, threadId: row.thread_id } as Run
-      const next = finish(run, parts, reason)
-      if (message && (JSON.stringify(parts) !== JSON.stringify(next) || message.status === "streaming")) {
-        const updated = store.updateMessage({
-          threadId: run.threadId,
-          messageId: message.id,
-          patch: {
-            parts: next,
-            status: row.status === "succeeded" ? "complete" : row.status === "canceled" ? "canceled" : "failed",
-          },
-        })
-        if (!updated.success) throw new Error(updated.error)
-      }
-      clearPending(row.id)
-    })()
+          .get(row.thread_id, row.id, row.reply_message_id) as {
+          id: string
+          parts_json: string
+          status: string
+        } | null
+        const parts = message ? (JSON.parse(message.parts_json) as MessagePart[]) : []
+        const reason = terminalReason(row.status)
+        const run = { id: row.id, threadId: row.thread_id } as Run
+        const next = finish(run, parts, reason)
+        if (message && (JSON.stringify(parts) !== JSON.stringify(next) || message.status === "streaming")) {
+          const updated = store.updateMessage({
+            threadId: run.threadId,
+            messageId: message.id,
+            patch: {
+              parts: next,
+              status: row.status === "succeeded" ? "complete" : row.status === "canceled" ? "canceled" : "failed",
+            },
+          })
+          if (!updated.success) throw new Error(updated.error)
+        }
+        clearPending(row.id)
+      })
+      .immediate()
   }
   const reconcile = (store: StoreApi, threadId?: string): void => {
-    database?.transaction(() =>
-      getPendingRuns(threadId).forEach((row) => {
-        reconcileRun(store, row.id)
-      }),
-    )()
+    database
+      ?.transaction(() =>
+        getPendingRuns(threadId).forEach((row) => {
+          reconcileRun(store, row.id)
+        }),
+      )
+      .immediate()
   }
   const reconcilePending = async (store: StoreApi, threadId: string): Promise<void> => {
     for (const row of getPendingRuns(threadId)) {
-      reconcileRun(store, row.id)
+      if (database) await writeDatabaseAsync(database, () => reconcileRun(store, row.id))
       // Live imports may introduce many completed turns; let other clients run between them.
       await new Promise<void>((resolve) => setImmediate(resolve))
     }

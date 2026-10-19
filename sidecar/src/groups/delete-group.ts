@@ -30,16 +30,18 @@ export const deleteGroupRoute = (kernel: Kernel): RouteModule["routes"][number] 
     const replay = getGroupReplayRows(database, groupId)
     const attachments = getGroupAttachments(database, groupId, replay)
     removeGroupFiles(kernel, database, groupId)
-    database.transaction(() => {
-      database
-        .query(
-          "INSERT INTO settings(key,value_json,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
-        )
-        .run(`storage.deleted-attachments:group:${groupId}`, JSON.stringify([...attachments]), Date.now())
-      purgeReplayRows(database, replay)
-      deleteGroupHistory(database, groupId)
-      database.query("DELETE FROM bot_groups WHERE id = ?").run(groupId)
-    })()
+    database
+      .transaction(() => {
+        database
+          .query(
+            "INSERT INTO settings(key,value_json,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+          )
+          .run(`storage.deleted-attachments:group:${groupId}`, JSON.stringify([...attachments]), Date.now())
+        purgeReplayRows(database, replay)
+        deleteGroupHistory(database, groupId)
+        database.query("DELETE FROM bot_groups WHERE id = ?").run(groupId)
+      })
+      .immediate()
     kernel.publish({ type: "transcript.resync" })
     kernel.publish({ type: "group.deleted", groupId })
     await collectUnusedOutputBlobs(database, kernel.paths.appData, Date.now(), null, attachments)
