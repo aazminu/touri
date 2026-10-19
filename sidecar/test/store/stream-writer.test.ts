@@ -860,15 +860,48 @@ test("a stopped worker cannot grow writer buffers or projections past the byte l
 }, 15_000)
 
 test("quarantined writes fail their durability boundary before approval can continue", async () => {
-  const f = await fixture()
+  const batchErrors: boolean[] = []
+  const f = await fixture(undefined, (url) => {
+    const worker = new Worker(url, { smol: true, ref: false })
+    worker.addEventListener("message", ({ data }) => {
+      if (data.type === "batch-error") batchErrors.push(data.busy)
+    })
+    return worker
+  })
   cleanups.add(f.close)
   f.database.exec(`CREATE TRIGGER fail_stream BEFORE INSERT ON transcript_entries
     WHEN json_extract(NEW.event_json,'$.type') = 'message.delta'
     BEGIN SELECT RAISE(ABORT, 'Synthetic permanent failure'); END`)
+  expect(f.database.inTransaction).toBe(false)
   f.store.appendDelta({ threadId: "t", messageId: "a", partIndex: 0, delta: "não confirmado" })
+  const drained = f.store.flushWritesAsync?.()
+  if (!drained) throw new Error("Missing asynchronous durability boundary")
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<Error>((resolve) => {
+    timer = setTimeout(
+      () =>
+        resolve(
+          new Error(
+            `Durability did not settle: ${JSON.stringify({ batchErrors, inTransaction: f.database.inTransaction })}`,
+          ),
+        ),
+      2500,
+    )
+  })
+  cleanups.add(() => clearTimeout(timer))
 
-  await expect(f.store.flushWritesAsync?.()).rejects.toThrow("Stream writes were rejected")
+  const failure = await Promise.race([
+    drained.then(
+      () => null,
+      (error: unknown) => error,
+    ),
+    deadline,
+  ])
 
+  expect(failure).toBeInstanceOf(Error)
+  if (!(failure instanceof Error)) throw new Error("Missing durability rejection")
+  expect(failure.message).toBe("Stream writes were rejected")
+  expect(batchErrors.filter((busy) => !busy)).toHaveLength(4)
   expect(f.events.some(({ event }) => event.type === "message.delta")).toBe(false)
   expect(f.database.query("SELECT COUNT(*) AS n FROM rejections").get()).toEqual({ n: 1 })
 })
