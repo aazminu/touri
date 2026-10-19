@@ -665,7 +665,6 @@ const AppContent = ({ kernel }: AppProps) => {
         "new-bot": "bot",
         "new-group": "group",
         "connect-project": "project",
-        "open-doctor": "doctor",
       }
       openModal(kinds[command.action])
       return

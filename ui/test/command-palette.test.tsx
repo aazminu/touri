@@ -282,3 +282,33 @@ it("leaves search indexing idle while the palette is closed", async () => {
   expect(input).toHaveFocus()
   expect(index).toHaveBeenCalled()
 })
+
+it("lists the Doctor screen as a single localized Diagnóstico entry without raw Doctor labels", async () => {
+  const settings = settingsIndex({ hasBot: true })
+  const doctorEntries = settings.filter((entry) => entry.destination.kind === "doctor")
+  expect(doctorEntries).toHaveLength(1)
+  expect(doctorEntries[0]?.label).toBe("Diagnóstico")
+
+  const index = buildPaletteIndex({ bots: [], threads: [], settings, hasBot: true })
+  expect(index.items.some((item) => item.label.includes("Doctor"))).toBe(false)
+  expect(index.items.some((item) => item.label === "Abrir Doctor")).toBe(false)
+
+  for (const query of ["doctor", "diagnostico", "verificar"]) {
+    const groups = searchPalette({ index, query, messages: [], recentIds: [] })
+    const items = groups.flatMap((group) => group.items)
+    expect(items.some((item) => item.label.includes("Doctor"))).toBe(false)
+    const doctorItems = items.filter(
+      (item) => item.command.kind === "setting" && item.command.destination.kind === "doctor",
+    )
+    expect(doctorItems).toHaveLength(1)
+    expect(doctorItems[0]?.label).toBe("Diagnóstico")
+  }
+
+  await start()
+  const input = await search("verifique o ambiente")
+  expect(activeOption(input)).toHaveTextContent("Diagnóstico")
+  expect(activeOption(input)).not.toHaveTextContent("Doctor")
+  fireEvent.keyDown(input, { key: "Enter" })
+  expect(await screen.findByRole("dialog", { name: "Diagnóstico" })).toBeVisible()
+})
+
