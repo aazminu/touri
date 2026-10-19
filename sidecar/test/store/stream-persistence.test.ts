@@ -74,18 +74,34 @@ const createSourceWorker = (source: string): Worker => {
 
 test("the controller retries a worker lost after commit and publishes exactly once from journal references", async () => {
   let starts = 0
+  let observedCommitted = false
   const f = await getFixture(() => {
     starts += 1
     const source =
       starts === 1
-        ? streamPersistenceWorkerSource.replace("self.postMessage(result);", "self.close();")
+        ? streamPersistenceWorkerSource.replace(
+            "self.postMessage(result);",
+            `
+          self.postMessage({ type: "test-committed" });
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
+        `,
+          )
         : streamPersistenceWorkerSource
-    return createSourceWorker(source)
+    const worker = createSourceWorker(source)
+    worker.addEventListener("message", ({ data }) => {
+      if (data.type !== "test-committed") return
+      observedCommitted =
+        (f.database.query("SELECT text FROM messages WHERE thread_id='thread'").get() as { text: string }).text ===
+        "durable"
+      worker.terminate()
+    })
+    return worker
   })
 
   await f.persistence.submit([getDelta()])
 
   expect(starts).toBe(2)
+  expect(observedCommitted).toBe(true)
   expect(f.published.filter((event) => event.type === "message.delta")).toHaveLength(1)
   expect(f.database.query("SELECT text FROM messages WHERE thread_id='thread'").get()).toEqual({ text: "durable" })
   expect(
