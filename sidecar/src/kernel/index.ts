@@ -242,6 +242,7 @@ export const createKernel = ({
             ok: true,
             version,
             schemaVersion: SCHEMA_VERSION,
+            draining: services.use("runtime.isDraining")?.() ?? false,
             ...getHostIdentity(),
             historyMigration: historyMigrationStatus(database),
             eventLoop: diagnostics.getSnapshot(),

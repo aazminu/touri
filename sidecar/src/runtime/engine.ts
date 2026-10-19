@@ -180,7 +180,8 @@ type RuntimeEngine = {
     trigger: RunTrigger
     routineRunId?: Id
     delegated?: boolean
-  }) => Result<{ run: Run }, "THREAD_NOT_FOUND" | "BOT_PAUSED">
+    continuing?: boolean
+  }) => Result<{ run: Run }, "THREAD_NOT_FOUND" | "BOT_PAUSED" | "RUNTIME_DRAINING">
   getRunSnapshot: (run: Run) => Run
   getWorkRuns: () => Array<Run>
   settingsChanged: () => void
@@ -190,7 +191,9 @@ type RuntimeEngine = {
   cancel: (id: Id) => Result<{ run: Run }, "NOT_FOUND">
   cancelRuns: (runIds: Id[]) => Promise<void>
   cancelBotTurns: (args: { botId: Id }) => Promise<void>
-  retry: (id: Id) => Result<{ run: Run }, "NOT_FOUND" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "CONFLICT">
+  retry: (
+    id: Id,
+  ) => Result<{ run: Run }, "NOT_FOUND" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "CONFLICT" | "RUNTIME_DRAINING">
   answerApproval: (args: {
     approvalId: Id
     decision: "approved" | "denied"
@@ -225,9 +228,11 @@ type RuntimeEngine = {
     scheduledFor?: number
   }) => Result<
     { routineRun: RoutineRun },
-    "NOT_FOUND" | "INVALID_ARGS" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "DELEGATION_LIMIT"
+    "NOT_FOUND" | "INVALID_ARGS" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "DELEGATION_LIMIT" | "RUNTIME_DRAINING"
   >
   tick: (now?: number) => Promise<void>
+  beginDrain: () => void
+  waitForDrain: () => Promise<void>
   shutdown: () => Promise<void>
 }
 
@@ -310,6 +315,7 @@ export const createRuntimeEngine = ({
     }
   }
   let queued: Array<Id> = persistence.listQueuedRuns().map((run) => run.id)
+  let draining = false
   let shuttingDown = false
   let shutdownPromise: Promise<void> | null = null
   const tools = createToolResolutions(kernel)
@@ -351,7 +357,7 @@ export const createRuntimeEngine = ({
   const notices = createRuntimeNotices({ kernel })
   const work: WorkState = createWorkState({ database: kernel.db as Database })
   const continuations = createRunContinuations({ database: kernel.db })
-  const pendingContinuations = new Map<Id, { timer: ReturnType<typeof setTimeout>; run: Run }>()
+  const pendingContinuations = new Map<Id, { timer: ReturnType<typeof setTimeout>; run: Run; plan: ContinuationPlan }>()
   const goalDeadlines = new Map<Id, ReturnType<typeof startGoalDeadline>>()
   const getGoalNow = goalDeadlineClock?.now ?? Date.now
   const goals = createGoalRuntime(
@@ -365,7 +371,7 @@ export const createRuntimeEngine = ({
         cancel(runId)
       },
       getRuns: persistence.listRuns,
-      isStopping: () => shuttingDown,
+      isStopping: () => shuttingDown || draining,
       onSaved: (goal) => {
         if (goal.runId) goalDeadlines.get(goal.runId)?.setDeadline(goal.deadlineAt)
       },
@@ -1750,6 +1756,7 @@ export const createRuntimeEngine = ({
       threadId: thread.id,
       requestMessageId: marker.message.id,
       trigger: run.routineRunId ? "routine" : "retry",
+      continuing: true,
       ...(run.routineRunId ? { routineRunId: run.routineRunId } : {}),
     })
     if (!next.success) return false
@@ -1803,16 +1810,19 @@ export const createRuntimeEngine = ({
     const timer = setTimeout(
       () => {
         pendingContinuations.delete(run.id)
-        // A newer turn on the thread (the user wrote meanwhile) supersedes the continuation.
-        const superseded = persistence.listRuns(run.threadId)[0]?.id !== run.id
-        const ready =
-          !shuttingDown && ownsRuntime() && (plan.reason === "permission_granted" || resumeEnabled()) && !superseded
+        const ready = !shuttingDown && canStartContinuation(run, plan)
         if (!ready || !startContinuation({ run, plan })) abandonContinuation({ run, status: "failed" })
       },
       plan.reason === "permission_granted" ? 0 : resumeBackoffMs,
     )
-    pendingContinuations.set(run.id, { timer, run })
+    pendingContinuations.set(run.id, { timer, run, plan })
   }
+
+  const canStartContinuation = (run: Run, plan: ContinuationPlan): boolean =>
+    ownsRuntime() &&
+    (plan.reason === "permission_granted" || resumeEnabled()) &&
+    // A newer user turn supersedes a continuation, including during shutdown.
+    persistence.listRuns(run.threadId)[0]?.id === run.id
 
   const failTurn = ({
     run,
@@ -1869,7 +1879,7 @@ export const createRuntimeEngine = ({
     while (!shuttingDown && ownsRuntime() && active.size < getMaxConcurrentRuns()) {
       const nextIndex = queued.findIndex((runId) => {
         const run = persistence.getRun(runId)
-        return run !== null && !active.has(run.threadId)
+        return run !== null && !active.has(run.threadId) && (!draining || canDrainRun(run.id))
       })
       if (nextIndex < 0) return
       const runId = queued[nextIndex]
@@ -1891,13 +1901,18 @@ export const createRuntimeEngine = ({
     trigger,
     routineRunId,
     delegated = false,
+    continuing = false,
   }: {
     threadId: Id
     requestMessageId: Id
     trigger: RunTrigger
     routineRunId?: Id
     delegated?: boolean
-  }): Result<{ run: Run }, "THREAD_NOT_FOUND" | "BOT_PAUSED"> => {
+    continuing?: boolean
+  }): Result<{ run: Run }, "THREAD_NOT_FOUND" | "BOT_PAUSED" | "RUNTIME_DRAINING"> => {
+    if (shuttingDown || (draining && !delegated && !continuing))
+      return { success: false, errorCode: "RUNTIME_DRAINING", error: "O servidor está encerrando." }
+
     const store = kernel.services.use("store.api")
     const thread = store?.getThread({ threadId })
     const bot = thread ? store?.getBot({ botId: thread.botId }) : null
@@ -1933,6 +1948,8 @@ export const createRuntimeEngine = ({
       // A synchronous peer request cannot wait behind its caller's occupied slot.
       // Only group runtime uses this path; depth/call/cycle limits bound extra work.
       queueMicrotask(() => {
+        if (shuttingDown) return
+
         if (active.has(threadId)) {
           cancel(run.id)
           return
@@ -2019,7 +2036,7 @@ export const createRuntimeEngine = ({
     await Promise.all(runIds.map((runId) => executions.get(runId)))
   }
 
-  const retry = (id: Id): Result<{ run: Run }, "NOT_FOUND" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "CONFLICT"> => {
+  const retry: RuntimeEngine["retry"] = (id) => {
     const previous = persistence.getRun(id)
     if (!previous?.requestMessageId) return { success: false, errorCode: "NOT_FOUND", error: "Run not found" }
     if (["queued", "starting", "running", "succeeded"].includes(previous.status))
@@ -2321,8 +2338,10 @@ export const createRuntimeEngine = ({
     scheduledFor?: number
   }): Result<
     { routineRun: RoutineRun },
-    "NOT_FOUND" | "INVALID_ARGS" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "DELEGATION_LIMIT"
+    "NOT_FOUND" | "INVALID_ARGS" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "DELEGATION_LIMIT" | "RUNTIME_DRAINING"
   > => {
+    if (draining) return { success: false, errorCode: "RUNTIME_DRAINING", error: "O servidor está encerrando." }
+
     const routine = persistence.getRoutine(routineId)
     const store = kernel.services.use("store.api")
     if (!routine || !store) return { success: false, errorCode: "NOT_FOUND", error: "Routine not found" }
@@ -2465,7 +2484,7 @@ export const createRuntimeEngine = ({
   }
 
   const tick = async (now = getNow()): Promise<void> => {
-    if (shuttingDown || !ownsRuntime()) return
+    if (shuttingDown || draining || !ownsRuntime()) return
     const updateNextRun = ({ routineId, nextRunAt }: { routineId: Id; nextRunAt: number | null }): void => {
       const latest = persistence.getRoutine(routineId)
       if (latest) persistence.updateRoutine({ ...latest, nextRunAt, updatedAt: Date.now() })
@@ -2505,9 +2524,25 @@ export const createRuntimeEngine = ({
     }
   }
 
+  const beginDrain = (): void => {
+    draining = true
+  }
+
+  const canDrainRun = (runId: Id): boolean => continuations.link(runId) !== null || continuations.isGroupRun(runId)
+
+  const waitForDrain = async (): Promise<void> => {
+    await startupCleanup
+    while (!shuttingDown && (executions.size > 0 || pendingContinuations.size > 0 || queued.some(canDrainRun))) {
+      await drain()
+      await Promise.all(executions.values())
+      // Continuations can be scheduled after their provider execution finishes.
+      await new Promise<void>((resolve) => setTimeout(resolve, 10))
+    }
+  }
+
   const shutdown = (): Promise<void> => {
     if (shutdownPromise) return shutdownPromise
-    shuttingDown = true
+    draining = true
     unsubscribeGroupTurns()
     for (const state of states.values()) {
       if (state.outputTimer) clearTimeout(state.outputTimer)
@@ -2516,8 +2551,11 @@ export const createRuntimeEngine = ({
     for (const [id, pending] of pendingContinuations) {
       clearTimeout(pending.timer)
       pendingContinuations.delete(id)
-      abandonContinuation({ run: pending.run, status: "failed" })
+      // Save the next run before stopping so a backoff or approval cannot disappear.
+      if (!canStartContinuation(pending.run, pending.plan) || !startContinuation(pending))
+        abandonContinuation({ run: pending.run, status: "failed" })
     }
+    shuttingDown = true
     for (const [id, controller] of controllers) {
       const state = getState(id)
       state.completionError ??= { errorClass: "app_restart", errorMessage: "touri restarted" }
@@ -2652,6 +2690,8 @@ export const createRuntimeEngine = ({
     deleteRoutine,
     runRoutine,
     tick,
+    beginDrain,
+    waitForDrain,
     shutdown,
   }
 }
