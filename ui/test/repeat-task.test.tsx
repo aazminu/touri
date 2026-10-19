@@ -334,3 +334,23 @@ it("a task repeated from a group chat posts back into the same group conversatio
   })
   expect(t("Conversa do grupo {group}", { group: "Email Geral" }, "en")).toBe("Group conversation Email Geral")
 })
+
+it("labels all Brazilian timezone options in plain language instead of raw IANA identifiers", () => {
+  const f = fixture()
+  render(<RoutineEditor initial={f.draft} bots={[f.bot]} actions={f.actions} host="mac" onClose={vi.fn()} />)
+  const timezone = screen.getByLabelText("Fuso horário")
+  const options = within(timezone).getAllByRole("option") as HTMLOptionElement[]
+  expect(options.map((option) => ({ value: option.value, label: option.textContent }))).toEqual([
+    { value: "America/Sao_Paulo", label: "Horário de Brasília" },
+    { value: "America/Manaus", label: "Horário do Amazonas" },
+    { value: "America/Rio_Branco", label: "Horário do Acre" },
+    { value: "America/Noronha", label: "Horário de Fernando de Noronha" },
+    { value: "UTC", label: "UTC" },
+  ])
+  fireEvent.change(timezone, { target: { value: "America/Manaus" } })
+  const preview = screen.getByRole("region", { name: "Próximas três execuções" })
+  expect(within(preview).getByText("Horário do Amazonas")).toBeVisible()
+  expect(t("Horário do Amazonas", {}, "en")).toBe("Amazon time")
+  expect(t("Horário do Acre", {}, "en")).toBe("Acre time")
+  expect(t("Horário de Fernando de Noronha", {}, "en")).toBe("Fernando de Noronha time")
+})

@@ -1,7 +1,7 @@
 import type { Bot, BotGroup, HostKind, Routine } from "@touri/contracts"
 import { nextCronSlot, parseCron, validTimezone } from "@touri/contracts/routine-cron"
 import { useEffect, useMemo, useRef, useState } from "react"
-import { getHostLabel, t } from "../i18n"
+import { getHostLabel, type TranslationKey, t } from "../i18n"
 import type { RoutineDraft } from "../routineDraft"
 import { routineSchedule, simpleCron, simpleSchedule } from "../routineSchedule"
 import type { WorkspaceActions } from "../useWorkspace"
@@ -18,6 +18,18 @@ const weekdays = [
   "sexta-feira",
   "sábado",
 ] as const
+
+const routineTimezoneLabels = {
+  "America/Sao_Paulo": "Horário de Brasília",
+  "America/Manaus": "Horário do Amazonas",
+  "America/Rio_Branco": "Horário do Acre",
+  "America/Noronha": "Horário de Fernando de Noronha",
+} as const satisfies Record<string, TranslationKey>
+
+export const routineTimezoneLabel = (zone: string) => {
+  const key = routineTimezoneLabels[zone as keyof typeof routineTimezoneLabels]
+  return key ? t(key) : zone
+}
 
 export const routineHostNotice = (host: HostKind) =>
   host === "server"
@@ -279,7 +291,7 @@ export const RoutineEditor = ({
                       ]),
                     ].map((zone) => (
                       <option key={zone} value={zone}>
-                        {zone === "America/Sao_Paulo" ? t("Horário de Brasília") : zone}
+                        {routineTimezoneLabel(zone)}
                       </option>
                     ))}
                   </select>
@@ -438,7 +450,7 @@ export const RoutineEditor = ({
               ) : (
                 <p role="alert">{t("Escolha dias, hora e fuso válidos para ver as próximas execuções.")}</p>
               )}
-              <small>{draft.timezone === "America/Sao_Paulo" ? t("Horário de Brasília") : draft.timezone}</small>
+              <small>{routineTimezoneLabel(draft.timezone)}</small>
             </section>
             <p className="routine-form-note">{routineHostNotice(host)}</p>
             {error && <p role="alert">{error}</p>}
