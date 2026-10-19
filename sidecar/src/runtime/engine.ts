@@ -591,12 +591,14 @@ export const createRuntimeEngine = ({
     if (state.partPublishImmediate) clearImmediate(state.partPublishImmediate)
     state.partPublishImmediate = null
     state.lastOutputPublishedAt = Date.now()
-    const partIndices = [...state.dirtyParts].sort((left, right) => left - right)
     if (status === "streaming" && !state.cancelRequested)
-      partIndices.forEach((partIndex) => {
-        materializePartText(state, partIndex, runStage)
-      })
+      [...state.dirtyParts]
+        .sort((left, right) => left - right)
+        .forEach((partIndex) => {
+          materializePartText(state, partIndex, runStage)
+        })
     else materializePendingText(state, runStage)
+    const partIndices = [...state.dirtyParts].sort((left, right) => left - right)
     const messageId = state.replyMessageId
     if (status === "streaming" && !messageId) return
     if (store.appendParts) {
@@ -770,7 +772,6 @@ export const createRuntimeEngine = ({
     state: RunState
   }): void => {
     if (shuttingDown) return
-    if (state.cancelRequested || controllers.get(run.id)?.signal.aborted) return
     // A newer runtime may have fenced this writer during restart recovery.
     if (!isLiveForEvent(run, state)) {
       controllers.get(run.id)?.abort()

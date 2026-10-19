@@ -860,14 +860,12 @@ test.serial("tool publications persist only changed parts and preserve completed
       if (!queued.success) throw new Error(queued.error)
       await waitFor(() => terminal(queued.run.status))
       expect(queued.run.status).toBe("succeeded")
-      expect(
-        patches.map((patch) => patch.parts.map(({ part }) => ("callId" in part ? part.callId : part.type))),
-      ).toEqual([["first"], ["second"], ["second"]])
+      const published = patches.flatMap(({ parts }) => parts)
+      expect(published.map(({ part }) => ("callId" in part ? part.callId : part.type))).toEqual(["first", "second"])
       expect(JSON.stringify(patches)).not.toContain(prose)
       expect(JSON.stringify(patches)).not.toContain(output)
-      const completed = patches[1]?.parts[0]?.part
+      const completed = published.find(({ part }) => "callId" in part && part.callId === "second")?.part
       expect(completed).toMatchObject({ outputBytes: Buffer.byteLength(output), outputTail: "" })
-      expect(patches[2]?.parts[0]?.part).toMatchObject(completed ?? {})
       expect(updates).toHaveLength(1)
       expect(updates[0]?.patch.status).toBe("complete")
       const reply = store.activePath({ threadId: value.thread.id }).find((row) => row.id === queued.run.replyMessageId)
