@@ -125,13 +125,15 @@ export type StandingGrant = { id: Id; botId: Id; scope: ApprovalScope; grantedAt
 export type BotCapability = 'browser' | 'computer_use'
 export type CapabilityRequestInput = { capability: BotCapability; reason: string }
 
-export type ApprovalInput = { groupMemberId?: Id; ctx: Pick<ToolContext, 'botId' | 'threadId' | 'runId' | 'signal'>; scope: ApprovalScope; toolName: string; input: unknown; toolUseId?: string; allowStanding?: boolean; isCurrent?: () => boolean }
-export type ApprovalResult = Result<{ behavior: 'allow' | 'deny'; updatedInput?: unknown; message?: string }, 'NOT_FOUND' | 'TIMEOUT' | 'DENIED'>
+export type ApprovalInput = { groupMemberId?: Id; ctx: Pick<ToolContext, 'botId' | 'threadId' | 'runId' | 'signal'>; scope: ApprovalScope; toolName: string; input: unknown; toolUseId?: string; allowStanding?: boolean; teamProposal?: TeamProposalReview; isCurrent?: () => boolean }
+export type ApprovalResult = Result<{ behavior: 'allow' | 'deny'; approvalId?: Id; updatedInput?: unknown; message?: string }, 'NOT_FOUND' | 'TIMEOUT' | 'DENIED'>
 
 export type BotFolder = { path: AbsolutePath; access: 'read-only' | 'read-write' }
 export type BotBrowser = 'touri' | 'local' | 'machine'
+export type BotAutomaticConversationMode = 'main' | 'task'
 
 export type Bot = {
+  responsiblePersonId?: Id | null
   /** Defaults for bots created before schema 16: [] and false. */
   folders?: Array<BotFolder>
   anyFolderAccess?: boolean
@@ -139,7 +141,11 @@ export type Bot = {
   /** Defaults for bots created before schema 17: null and false. */
   providerProfile?: string | null
   claudeAiConnectors?: boolean
+  /** Defaults for bots created before schema 34: main. */
+  automaticConversationMode?: BotAutomaticConversationMode
 
+  /** Set only by explicit creation from the team-builder job; immutable afterward. */
+  teamBuilder: boolean
   id: Id
   name: string
   title: string | null
@@ -203,6 +209,7 @@ export type BotGroup = {
 export type GroupInput = Pick<BotGroup, 'name' | 'color' | 'avatarShape' | 'memberIds' | 'coordinatorBotId'>
 
 export type Thread = {
+  ownerPersonId?: Id | null
   groupId?: Id | null
   groupThreadId?: Id | null
   generation?: number
@@ -273,6 +280,7 @@ export type RunErrorClass =
   | 'oom'
   | 'tool_error'
   | 'app_restart'
+  | 'group_context_missing'
   | 'unknown'
 
 export type RunUsage = {
@@ -426,6 +434,8 @@ export type NoticePart = {
 export type ApprovalPart = {
   /** A delegation approval belongs to the caller but waits on this group member. */
   groupMemberId?: Id
+  teamProposal?: TeamProposalReview
+  teamResult?: TeamCreationResult
   type: 'approval'
   createdAt?: EpochMs
   approvalId: Id
@@ -464,7 +474,7 @@ export type Message = {
   runId: Id | null
   text: string
   parts: Array<MessagePart>
-  sender: { name: string; id: string } | null
+  sender: { name: string; id: string; avatarSeed?: string; kind?: 'person' } | null
   source: RowSource
   createdAt: EpochMs
   updatedAt: EpochMs
@@ -779,8 +789,33 @@ export type ProviderAdapter = {
 /* origin. WebSocket: /api/v1/events?token=<token> (token also accepted as subprotocol).       */
 /* ------------------------------------------------------------------------------------------ */
 
-export type CreateBotInput = { cloudApiKey?: string } & Pick<Bot, 'name' | 'provider'> &
-  Partial<Pick<Bot, 'title' | 'roleLine' | 'description' | 'color' | 'avatarShape' | 'avatarSeed' | 'instructions' | 'model' | 'reasoningEffort' | 'access' | 'approvals' | 'projectId' | 'cwd' | 'browserEnabled' | 'browser' | 'computerUse' | 'machine' | 'machineIdleMinutes' | 'vmProviderLogin' | 'hostComputerUse' | 'folders' | 'anyFolderAccess' | 'providerProfile' | 'claudeAiConnectors'>>
+export type TeamBotDraft = Pick<Bot, 'name' | 'provider' | 'instructions'> & {
+  roleLine: string
+  model?: string | null
+  color?: string | null
+  avatarShape?: AvatarShape | null
+  avatarSeed?: string | null
+}
+/** Group members refer only to names of bots in this proposal. */
+export type TeamCreateInput = {
+  bots: Array<TeamBotDraft>
+  group?: { name: string; members: Array<string>; coordinator?: string }
+}
+export type TeamProviderStatus = 'ready' | 'needs-setup' | 'unknown'
+export type TeamProposalReview = {
+  proposal: TeamCreateInput
+  providers: Array<{ provider: Provider; status: TeamProviderStatus }>
+}
+export type TeamCreationResult = {
+  status: 'created' | 'partial' | 'failed'
+  bots: Array<{ id: Id; name: string; threadId: Id | null }>
+  group?: { id: Id; name: string; threadId: Id }
+  /** Fixed public failure code; never raw filesystem/provider errors. */
+  error?: 'creation-failed'
+}
+
+export type CreateBotInput = { cloudApiKey?: string; jobId?: string } & Pick<Bot, 'name' | 'provider'> &
+  Partial<Pick<Bot, 'title' | 'roleLine' | 'description' | 'color' | 'avatarShape' | 'avatarSeed' | 'instructions' | 'model' | 'reasoningEffort' | 'access' | 'approvals' | 'projectId' | 'cwd' | 'browserEnabled' | 'automaticConversationMode' | 'browser' | 'computerUse' | 'machine' | 'machineIdleMinutes' | 'vmProviderLogin' | 'hostComputerUse' | 'folders' | 'anyFolderAccess' | 'providerProfile' | 'claudeAiConnectors'>>
 
 /** A named login under `<appData>/provider-profiles/<name>`, created with `touri profile login`. */
 export type ProviderProfile = { name: string; provider: Provider; loggedIn: boolean; account: string | null }
@@ -839,6 +874,7 @@ export type SendMessageInput = {
   parentId: Id | null
   text: string
   attachmentIds: Array<Id>
+  sender?: { name: string; id: string; avatarSeed?: string; kind?: 'person' }
 }
 
 export type ApiRoutes = {
@@ -868,7 +904,7 @@ export type ApiRoutes = {
   'POST /doctor/storage/compact': { req: { vacuum?: boolean }; res: { maintenance: StorageMaintenanceStatus } }
   'GET /bots': { req: {}; res: { bots: Array<Bot> } }
   'POST /bots': { req: CreateBotInput; res: { bot: Bot } }
-  'PATCH /bots/:id': { req: Partial<CreateBotInput & { paused: boolean }>; res: { bot: Bot } }
+  'PATCH /bots/:id': { req: Partial<Omit<CreateBotInput, 'jobId'> & { paused: boolean }>; res: { bot: Bot } }
   'DELETE /bots/:id': { req: { name: string; deleteVolumes?: boolean }; res: {} }
   'GET /bots/:id/mcp': { req: {}; res: { servers: Array<McpServer> } }
   'GET /bots/:id/integrations/telegram': { req: {}; res: { telegram: TelegramIntegration } }
@@ -1109,6 +1145,7 @@ export type NotificationPreferences = NotificationScopePreferences & {
   bots?: Record<Id, NotificationScopePreferences>
   /** Times use the local clock; an equal start and end silences the entire day. */
   quietHours?: { enabled: boolean; start: string; end: string; timeZone?: string }
+  sound?: { attention?: boolean; replies?: boolean; volume?: number }
 }
 
 export type NotifyResolution = 'allow' | 'deny' | 'answer' | 'replied' | 'dismissed' | 'expired' | 'canceled'
@@ -1206,11 +1243,17 @@ export type HostNotification =
 
 export type PreviewBounds = { x: number; y: number; width: number; height: number }
 export type ServerModeStatus = { mode: 'local' | 'server'; url: string | null }
-export type PendingDeepLink = { requestId: number; bot: string | null; thread: string | null }
+export type PendingDeepLink = {
+  requestId: number
+  bot: string | null
+  thread: string | null
+  notificationId: number | null
+}
 
 export type TauriCommands = {
   deep_link_pending: { args: {}; result: PendingDeepLink | null }
   deep_link_ack: { args: { requestId: number }; result: {} }
+  notification_system_quiet: { args: {}; result: boolean }
   server_mode_status: { args: {}; result: ServerModeStatus }
   server_mode_pair: { args: { url: string; code: string }; result: ServerModeStatus }
   server_mode_test: { args: {}; result: { ok: true } }
@@ -1307,15 +1350,53 @@ export type StoreApi = {
   setActiveLeaf: (args: { threadId: Id; leafId: Id }) => Result<{ thread: Thread }, 'NOT_FOUND'>
   getBot: (args: { botId: Id }) => Bot | null
   getThread: (args: { threadId: Id }) => Thread | null
-  createThread: (args: { botId: Id; kind: ThreadKind; title: string; parentThreadId?: Id; routineRunId?: Id; groupId?: Id; groupThreadId?: Id }) => Result<{ thread: Thread }, 'BOT_NOT_FOUND'>
+  createThread: (args: { botId: Id; kind: ThreadKind; title: string; parentThreadId?: Id; routineRunId?: Id; groupId?: Id; groupThreadId?: Id; ownerPersonId?: Id }) => Result<{ thread: Thread }, 'BOT_NOT_FOUND'>
   updateThread: (args: { threadId: Id; patch: Partial<Pick<Thread, 'title' | 'carryoverNote' | 'usage' | 'unread' | 'activeLeafId'>> }) => Result<{ thread: Thread }, 'NOT_FOUND'>
-  search: (args: { q: string; botId?: Id; threadId?: Id; limit: number }) => Array<{ threadId: Id; messageId: Id; snippet: string }>
+  search: (args: {
+    q: string
+    botId?: Id
+    threadId?: Id
+    limit: number
+    personScope?: { personId: Id; channelIds: Array<Id> }
+  }) => Array<{ threadId: Id; messageId: Id; snippet: string }>
 }
 
 /** Cross-module services. Providers call `provide` in their init; consumers must tolerate `null` from `use`. */
 export type ServiceMap = {
+  'work.authorizeHttp': (input: { personId: Id; role: 'member' | 'admin'; method: string; pathname: string; body: unknown }) => { status: number; json: unknown } | null
+  'work.authorizeSocket': (input: { personId: Id; role: 'member' | 'admin'; path: string }) => boolean
+  'work.personForRun': (runId: Id) => Id | null
+  'work.isAdminRun': (runId: Id) => boolean
+  'work.visibleEvent': (input: { personId: Id; role: 'member' | 'admin'; event: UiEvent }) => boolean
+  'work.canAccessThread': (input: { personId: Id; role: 'member' | 'admin'; threadId: Id }) => boolean
+  'work.canAccessGroup': (input: { personId: Id; role: 'member' | 'admin'; groupId: Id }) => boolean
+  'work.canAccessBot': (input: { personId: Id; role: 'member' | 'admin'; botId: Id }) => boolean
+  'work.ownsBot': (input: { personId: Id; botId: Id }) => boolean
+  'work.accessibleBotIds': (input: { personId: Id; channelIds: Array<Id> }) => Array<Id>
+  'work.canAccessAttachments': (input: { personId: Id; role: 'member' | 'admin'; attachmentIds: Array<Id> }) => boolean
+  'work.canAccessRun': (input: { personId: Id; role: 'member' | 'admin'; runId: Id }) => boolean
+  'work.accessibleRunIds': (input: { personId: Id; channelIds: Array<Id>; runIds: Array<Id> }) => Array<Id>
+  'work.canAccessNotification': (input: {
+    personId: Id
+    role: 'member' | 'admin'
+    threadId: Id | null
+    kind: string
+    requestId: Id | null
+  }) => boolean
+  'work.personChannelIds': (personId: Id) => Array<Id>
+  'work.canApprove': (input: { personId: Id; approvalId: Id }) => boolean
+  'work.defaultPersonId': () => Id
+  'bots.validateCreation': (body: unknown) => Result<{ input: CreateBotInput }>
+  'bots.create': (input: {
+    body: unknown
+    signal: AbortSignal
+    isCurrent?: () => boolean
+    runId?: Id
+    responsiblePersonId?: Id
+  }) => Promise<Result<{ bot: Bot }>>
+  'approvals.completeTeam': (input: { approvalId: Id; ctx: Pick<ToolContext, 'botId' | 'threadId' | 'runId'>; result: TeamCreationResult }) => Promise<void>
   'bots.rename': (input: { botId: Id; name: string }) => Result<{ bot: Bot }, 'NOT_FOUND' | 'INVALID_ARGS'>
-  'bots.configureAccess': (input: { botId: Id; patch: Partial<Pick<Bot, 'projectId' | 'folders' | 'browserEnabled' | 'browser' | 'computerUse'>> }) => Result<{ bot: Bot }, 'NOT_FOUND' | 'INVALID_ARGS' | 'MACHINE_PROJECT_CHANGE'>
+  'bots.configureAccess': (input: { botId: Id; patch: Partial<Pick<Bot, 'projectId' | 'folders' | 'browserEnabled' | 'browser' | 'computerUse'>>; runId?: Id }) => Result<{ bot: Bot }, 'NOT_FOUND' | 'INVALID_ARGS' | 'MACHINE_PROJECT_CHANGE' | 'DENIED'> | Promise<Result<{ bot: Bot }, 'NOT_FOUND' | 'INVALID_ARGS' | 'MACHINE_PROJECT_CHANGE' | 'DENIED'>>
   'diagnostics.errors': () => Array<{ code: string; at: number }>
   'groups.runtime': {
     enqueue: (args: { threadId: Id; requestMessageId: Id; trigger: RunTrigger; routineRunId?: Id }) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'RUNTIME_DRAINING'>
@@ -1339,7 +1420,7 @@ export type ServiceMap = {
     sync: (args: { botId: Id; threadId: Id; userText: string; assistantText: string }) => void
   }
   'approvals.present': (input: ApprovalInput) => Promise<ApprovalResult>
-  'approvals.approve': (input: { approvalId: Id; decision: 'approved' | 'denied'; standing?: boolean; message?: string }) => Promise<Result<{}, 'NOT_FOUND'>>
+  'approvals.approve': (input: { approvalId: Id; decision: 'approved' | 'denied'; standing?: boolean; message?: string; source?: 'card' | 'notification' }) => Promise<Result<{}, 'NOT_FOUND' | 'DENIED'>>
   'approvals.settle': (input: { approvalId: Id; decision: 'denied' | 'expired' }) => void
   'doctor': { start: () => void; dispose: () => void; snapshot: (refresh?: boolean) => DoctorReport; settled: () => Promise<void> }
   'storage.maintenance': { scheduleSessionKeyRetry: () => void; start: (vacuum?: boolean) => boolean; snapshot: () => StorageMaintenanceStatus; dispose: (options?: { closing?: boolean }) => void }
@@ -1366,7 +1447,7 @@ export type ServiceMap = {
   'computer.input': ComputerInput
   'computer.isActive': () => { active: boolean; botId: Id | null }
   'notify.emit': (input: NotifyInput) => NotificationRecord
-  'runtime.answerApproval': (args: { approvalId: Id; decision: 'approved' | 'denied'; standing?: boolean; message?: string }) => Promise<Result<{}, 'NOT_FOUND'>>
+  'runtime.answerApproval': (args: { approvalId: Id; decision: 'approved' | 'denied'; standing?: boolean; message?: string; source?: 'card' | 'notification' }) => Promise<Result<{}, 'NOT_FOUND' | 'DENIED'>>
   'notify.resolve': (args: { requestId: string; resolution: NotifyResolution }) => void
 }
 

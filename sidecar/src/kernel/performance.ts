@@ -10,6 +10,10 @@ type FetchHandler<SocketData> = (request: Request, server: Server<SocketData>) =
 const STAGES = [
   "provider_frame_batch",
   "provider_frame_dispatch",
+  "provider_frame_json_parse",
+  "provider_frame_route",
+  "provider_event_redaction",
+  "runtime_request_path_lookup",
   "runtime_provider_event",
   "runtime_turn_finalization",
   "runtime_message_publish",
@@ -33,6 +37,7 @@ const STAGES = [
   "workspace_event_serialization",
   "workspace_websocket_broadcast",
   "routine_scheduler_dispatch",
+  "store_bot_home_startup_recovery",
   "store_transcript_startup_recovery",
   "database_page_maintenance",
   "storage_message_compaction_batch",

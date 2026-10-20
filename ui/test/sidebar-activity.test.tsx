@@ -143,6 +143,55 @@ const renderSidebar = (overrides: SidebarOverrides & { bots: Array<Bot>; threads
 const order = (): Array<string> =>
   Array.from(document.querySelectorAll<HTMLElement>("[data-bot-entry]")).map((entry) => entry.dataset.botEntry ?? "")
 
+it.each([30, 128])("keeps all %i grouped task conversations reachable in bounded history pages", (count) => {
+  const { bots, threads } = fixture()
+  const bot = bots[0]
+  const main = threads[0]
+  if (!bot || !main) throw new Error("Missing task history fixture")
+  const taskThreads = Array.from({ length: count }, (_, index) => ({
+    ...main,
+    id: `task-${index}`,
+    kind: "chat" as const,
+    title: `lead.reply · abcdef${index.toString(16).padStart(6, "0")}`,
+    createdAt: T0 + index,
+    updatedAt: T0 + index,
+  }))
+  const onSelectThread = vi.fn()
+  renderSidebar({
+    bots,
+    threads: [...threads, ...taskThreads],
+    selectedBotId: bot.id,
+    selectedThreadId: main.id,
+    onSelectThread,
+  })
+  const conversations = screen.getByRole("region", { name: "Conversas de alfa" })
+  const toggle = within(conversations).getByRole("button", { name: "Histórico de tarefas de lead.reply" })
+
+  expect(conversations.querySelectorAll(".thread-row")).toHaveLength(2)
+  fireEvent.click(toggle)
+  const history = screen.getByRole("region", { name: "Histórico de tarefas de lead.reply" })
+
+  expect(history.querySelectorAll(".thread-row")).toHaveLength(Math.min(count, 50))
+  if (count === 128) {
+    fireEvent.click(within(history).getByRole("button", { name: "Próxima página" }))
+    fireEvent.click(within(history).getByRole("button", { name: "Próxima página" }))
+
+    expect(history.querySelectorAll(".thread-row")).toHaveLength(28)
+    expect(within(history).getByRole("status")).toHaveTextContent("Execuções 101–128 de 128")
+    fireEvent.click(within(history).getByRole("button", { name: "Página anterior" }))
+    fireEvent.click(within(history).getByRole("button", { name: "Página anterior" }))
+  }
+  const oldest = history.querySelector<HTMLButtonElement>(".thread-row")
+  if (!oldest) throw new Error("Missing oldest task conversation")
+
+  fireEvent.click(oldest)
+  fireEvent.click(toggle)
+
+  expect(onSelectThread).toHaveBeenCalledWith("task-0")
+  expect(toggle).toHaveAttribute("aria-expanded", "false")
+  expect(conversations.querySelectorAll(".thread-row")).toHaveLength(2)
+})
+
 it("hides the work summary when no runs are active or queued", () => {
   const { bots, threads } = fixture()
 
@@ -243,8 +292,10 @@ it.each([
   })
 
   const row = screen.getByRole("button", { name: /Novas mensagens/ })
-  expect(row.querySelector("strong")).toHaveTextContent(/^Novas mensagens$/)
-  expect(row.querySelector("strong")).toHaveAttribute("title", tooltip)
+  const routineTitle = kind === "routine" ? "Rotina " : ""
+  const titleElement = row.querySelector("strong")
+  expect(titleElement).toHaveTextContent(`${routineTitle}Novas mensagens`)
+  expect(titleElement).toHaveAttribute("title", `${routineTitle}${tooltip}`)
   expect(row.querySelector("small")).toHaveTextContent(dateLabel)
   expect(thread.title).toBe(title)
 })
@@ -460,6 +511,21 @@ it("shows interrupted tasks only while pending and leaves the count on the notif
   expect(recovery).not.toHaveTextContent(/\d/)
   expect(screen.getByRole("button", { name: "Notificações, 1 precisa de atenção" })).toBeVisible()
   expect(screen.getAllByText("1", { selector: ".notification-badge" })).toHaveLength(1)
+})
+
+it("labels a postponed routine as such and keeps the bot out of needs-you", () => {
+  const { bots, threads } = fixture()
+  const notice = createMockApi().notify({
+    kind: "routine-deferred",
+    botId: "bot-alfa",
+    threadId: null,
+    title: "Rotina adiada: Resumo",
+    body: "A rotina não foi executada.",
+  })
+  renderSidebar({ bots, threads, notifications: [notice] })
+  expect(entry("bot-alfa")).not.toHaveAttribute("data-activity", "needs-you")
+  expect(within(entry("bot-alfa")).getByText("Rotina adiada")).toBeVisible()
+  expect(within(entry("bot-alfa")).queryByText(/Aguardando você|tarefa interrompida/)).toBeNull()
 })
 
 it("lets the bell open an approval that arrived before its notification", () => {

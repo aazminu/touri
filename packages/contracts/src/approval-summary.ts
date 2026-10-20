@@ -1,7 +1,10 @@
-import type { ApprovalPart } from "./types"
+import type { ApprovalPart, NotificationRecord } from "./types"
 
 type Locale = "pt-BR" | "en"
 type Approval = Pick<ApprovalPart, "request" | "detail" | "scope">
+
+export const isTeamCreateApprovalNotice = (notification: Pick<NotificationRecord, "kind" | "title">): boolean =>
+  notification.kind === "approval" && ["Criar time", "Create team"].includes(notification.title)
 
 const copy = {
   "Ativar navegador": "Enable browser",
@@ -68,6 +71,16 @@ export const approvalSummary = (approval: Approval, locale: Locale = "pt-BR"): {
   const ownTool = approval.scope
     ? approval.scope.server === "touri"
     : !name.includes("__") || name.startsWith("mcp__touri__")
+  if (ownTool && leaf === "team_create")
+    return locale === "en"
+      ? {
+          title: "Create team",
+          body: "Review each bot, provider and safe access before creating the team. Cancel creates nothing.",
+        }
+      : {
+          title: "Criar time",
+          body: "Revise cada bot, provedor e acesso seguro antes de criar o time. Cancelar não cria nada.",
+        }
   if (ownTool && leaf === "capability_request") {
     const input = inputValue(approval.detail)
     if (

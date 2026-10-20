@@ -31,9 +31,11 @@ import { approvalOutcome } from "../approvals/outcome"
 import { delegatedBot } from "../groups/security"
 import { createGroupStore } from "../groups/store"
 import { buildChildEnv } from "../kernel"
+import { writePrivateFileAsync } from "../kernel/async-files"
 import { writeDatabaseAsync } from "../kernel/database-write"
 import { folderAccessUnavailable, folderGrantProblem, refreshHostFolderAccess } from "../kernel/folder-capability"
 import { hasPathHistory } from "../kernel/message-path"
+import { externalizeMessagePartsAsync } from "../kernel/output-blobs"
 import type { PerformanceStage, PerformanceStageRunner } from "../kernel/performance"
 import { providerProfileEnv } from "../kernel/provider-profiles"
 import { redactStructured } from "../kernel/redact"
@@ -77,12 +79,13 @@ import { sessionFingerprint, workingDirectory } from "./session"
 import { createToolResolutions } from "./tool-resolutions"
 import { retryTransient } from "./transient-retry"
 import { turnConclusion } from "./turn-conclusion"
-import { bounded, randomHexToken, writePrivateFile } from "./utils"
+import { bounded, randomHexToken } from "./utils"
 import { startVmTurn } from "./vm-turn"
 import { createWorkState, type WorkState } from "./work-state"
 
 type RunState = {
   replyParentId?: Id | undefined
+  requestMessage: Message | null
   text: string
   pendingText: Array<string>
   pendingPartText: Map<number, { type: "text" | "reasoning"; chunks: Array<string> }>
@@ -110,6 +113,24 @@ type RunState = {
 
 type ContinuationPlan = { reason: ContinuationReason; originalRunId: Id }
 
+const getReplySnapshotPart = (part: MessagePart): MessagePart => {
+  if ("outputAttachmentId" in part && typeof part.outputAttachmentId === "string") return part
+  if (part.type === "tool_call" && isCompletedReplyTool(part) && (part.outputJson || part.outputTail))
+    return { ...part, outputJson: null, outputTail: "" }
+  if (part.type === "command" && isCompletedReplyTool(part) && part.outputTail) return { ...part, outputTail: "" }
+  if (part.type === "file_change" && isCompletedReplyTool(part) && part.diff) return { ...part, diff: null }
+
+  return part
+}
+
+const isCompletedReplyTool = (part: Extract<MessagePart, { callId: string }>): boolean => {
+  if (part.resolution) return part.resolution !== "running"
+  if (part.type === "tool_call") return part.ok !== null
+  if (part.type === "command") return part.exitCode !== null
+
+  return part.diff !== null
+}
+
 const appendPendingText = (state: RunState, partIndex: number, type: "text" | "reasoning", delta: string): void => {
   const pending = state.pendingPartText.get(partIndex) ?? { type, chunks: [] }
   // Provider chunks append in-place so each token does constant work as the reply grows.
@@ -119,6 +140,15 @@ const appendPendingText = (state: RunState, partIndex: number, type: "text" | "r
 }
 
 const getPartKey = (part: MessagePart): string | null => ("callId" in part ? `${part.type}\u0000${part.callId}` : null)
+
+// Shallow field identity: nested values compare by reference, so an unsure match still publishes.
+const isSamePart = (previous: MessagePart, next: MessagePart): boolean => {
+  const entries = Object.entries(next)
+  return (
+    entries.length === Object.keys(previous).length &&
+    entries.every(([key, value]) => Reflect.get(previous, key) === value)
+  )
+}
 
 const materializePartText = (state: RunState, partIndex: number, runStage?: PerformanceStageRunner): void => {
   const pending = state.pendingPartText.get(partIndex)
@@ -206,7 +236,8 @@ type RuntimeEngine = {
     decision: "approved" | "denied"
     standing?: boolean
     message?: string
-  }) => Promise<Result<object, "NOT_FOUND">>
+    source?: "card" | "notification"
+  }) => Promise<Result<object, "NOT_FOUND" | "DENIED">>
   approvalBridge: ReturnType<typeof createApprovalBridge>
   approvalPrompt: (args: {
     ctx: { botId: Id; threadId: Id; runId: Id | null; signal: AbortSignal }
@@ -248,6 +279,8 @@ const statusForError = (errorClass: RunErrorClass): RunStatus => {
   if (errorClass === "app_restart") return "interrupted"
   return "failed"
 }
+
+const DRAIN_CHANGE_TIMEOUT_MS = 1_000
 
 const initialUsage = (): RunUsage => ({
   inputTokens: 0,
@@ -313,8 +346,20 @@ export const createRuntimeEngine = ({
   const persistence: RuntimePersistence = createRuntimePersistence({ database: kernel.db })
   const ownerPath = `${kernel.paths.runDir}/runtime-owner`
   const owner = randomHexToken()
-  writePrivateFile({ root: kernel.paths.appData, path: ownerPath, content: owner })
+  let ownerWriteState: "pending" | "ready" | "failed" = "pending"
+  const ownerWrite = writePrivateFileAsync({ root: kernel.paths.appData, path: ownerPath, content: owner }).then(
+    () => {
+      ownerWriteState = "ready"
+    },
+    (error) => {
+      ownerWriteState = "failed"
+      throw error
+    },
+  )
   const ownsRuntime = (): boolean => {
+    // The runtime lock is already held; allow startup requests while this durable marker is written off-thread.
+    if (ownerWriteState === "pending") return true
+    if (ownerWriteState === "failed") return false
     try {
       return readFileSync(ownerPath, "utf8") === owner
     } catch {
@@ -332,6 +377,12 @@ export const createRuntimeEngine = ({
   const providers = new Map<Id, ProviderAdapter>()
   const states = new Map<Id, RunState>()
   const pendingApprovals = new Map<Id, PendingApproval>()
+  let drainChange = Promise.withResolvers<void>()
+  const signalDrainChange = (): void => {
+    const previous = drainChange
+    drainChange = Promise.withResolvers<void>()
+    previous.resolve()
+  }
   const measureStage = <Value>(stage: PerformanceStage, action: () => Value): Value =>
     runStage ? runStage(stage, action) : action()
   const codexOptions = {
@@ -410,7 +461,7 @@ export const createRuntimeEngine = ({
       kernel.db instanceof Database
         ? (kernel.db
             .query(`
-      SELECT sender_json IS NOT NULL AS delegated,
+      SELECT sender_json IS NOT NULL AND coalesce(json_extract(sender_json, '$.kind'), '') <> 'person' AS delegated,
         EXISTS(SELECT 1 FROM json_each(parts_json)
           WHERE json_extract(value, '$.type') = 'notice'
             AND json_extract(value, '$.code') = 'run_resumed') AS resumed
@@ -429,7 +480,7 @@ export const createRuntimeEngine = ({
       })
       .find((message) => message.id === run.requestMessageId)
     if (request?.parts.some((part) => part.type === "notice" && part.code === "run_resumed")) return "resume"
-    if (request?.sender) return "delegation"
+    if (request?.sender && request.sender.kind !== "person") return "delegation"
     if (run.trigger === "routine") return "routine"
     return "message"
   }
@@ -452,9 +503,13 @@ export const createRuntimeEngine = ({
     }
   }
   const getRunSnapshot = (run: Run): Run => getSnapshot(run, getQueueSnapshot())
-  const publishRun = (run: Run): void => kernel.publish({ type: "run.updated", run: getRunSnapshot(run) })
+  const publishRun = (run: Run): void => {
+    signalDrainChange()
+    kernel.publish({ type: "run.updated", run: getRunSnapshot(run) })
+  }
   const publishQueue = (): void => {
     const queue = getQueueSnapshot()
+    signalDrainChange()
     queue.waiting.forEach((run) => {
       kernel.publish({ type: "run.updated", run: getSnapshot(run, queue) })
     })
@@ -493,7 +548,12 @@ export const createRuntimeEngine = ({
     return isLive(run)
   }
 
-  const finishLiveRun = async (run: Run, finish: () => void, messageId?: Id): Promise<void> => {
+  const finishLiveRun = async (
+    run: Run,
+    prepare: () => Promise<void>,
+    finish: () => void,
+    messageId?: Id,
+  ): Promise<void> => {
     // Accepted streaming work survives even if the final transaction rolls back.
     try {
       await measureStage("runtime_stream_flush", () =>
@@ -505,6 +565,7 @@ export const createRuntimeEngine = ({
     } catch {
       // A failed stream drain must not leave its run active or prevent terminal state.
     }
+    await prepare()
     const write = (): void => {
       if (!isLive(run)) {
         tools.clearPendingMemory(run.id)
@@ -531,6 +592,7 @@ export const createRuntimeEngine = ({
       partIndices: new Map(),
       dirtyParts: new Set(),
       replyMessageId: null,
+      requestMessage: null,
       turnStarted: false,
       externalSessionId: null,
       rolloutPath: null,
@@ -573,17 +635,13 @@ export const createRuntimeEngine = ({
       status: "streaming",
       runId: run.id,
       text: state.text,
-      parts: structuredClone(state.parts),
+      parts: state.parts.map(getReplySnapshotPart),
       sender: null,
       source: "local",
     }
     const result = store.insertMessage({ message })
     if (!result.success) return
     state.replyMessageId = result.message.id
-    for (const index of state.dirtyParts) {
-      const part = state.parts[index]
-      if (part && !("callId" in part)) state.dirtyParts.delete(index)
-    }
     run.replyMessageId = result.message.id
     persistence.saveRun(run)
   }
@@ -672,14 +730,30 @@ export const createRuntimeEngine = ({
       const parts = tools.finish(run, state.parts, reason, persist)
       parts.forEach((part, index) => {
         const previous = state.parts[index]
-        const entries = Object.entries(part)
-        const changed =
-          !previous ||
-          entries.length !== Object.keys(previous).length ||
-          entries.some(([key, value]) => Reflect.get(previous, key) !== value)
-        if (changed) state.dirtyParts.add(index)
+        if (!previous || !isSamePart(previous, part)) state.dirtyParts.add(index)
       })
       state.parts = parts
+    })
+  }
+
+  const prepareFinalParts = async ({
+    run,
+    state,
+    store,
+    reason,
+  }: {
+    run: Run
+    state: RunState
+    store: StoreApi
+    reason: "cancelled_by_user" | "failed" | "interrupted_by_restart" | "unknown"
+  }): Promise<void> => {
+    finishParts({ run, state, reason, persist: false })
+    if (!(kernel.db instanceof Database) || !store.updateMessageAsync) return
+
+    state.parts = await externalizeMessagePartsAsync({
+      database: kernel.db,
+      appData: kernel.paths.appData,
+      parts: state.parts,
     })
   }
 
@@ -734,9 +808,11 @@ export const createRuntimeEngine = ({
     return result.success ? result.message.id : null
   }
 
-  const makeMcpToken = (threadId: Id): { command: string; args: Array<string>; env: Record<string, string> } => {
+  const makeMcpToken = async (
+    threadId: Id,
+  ): Promise<{ command: string; args: Array<string>; env: Record<string, string> }> => {
     const tokenPath = `${kernel.paths.runDir}/mcp-tokens/${threadId}`
-    writePrivateFile({ root: kernel.paths.appData, path: tokenPath, content: `${randomHexToken()}\n` })
+    await writePrivateFileAsync({ root: kernel.paths.appData, path: tokenPath, content: `${randomHexToken()}\n` })
     return {
       command: kernel.paths.sidecarBinary,
       args: ["mcp-stdio", "--thread", threadId],
@@ -820,8 +896,7 @@ export const createRuntimeEngine = ({
     if (event.type === "text_delta") {
       if (!event.delta) return
       if (!state.replyMessageId) {
-        const thread = store.getThread({ threadId: run.threadId })
-        const request = run.requestMessageId && thread ? getActivePathMessage({ store, run }) : null
+        const request = state.requestMessage
         if (request) ensureReply({ run, state, store, parentId: request.id })
       }
       // Provider items are separate Markdown documents; chunks within an item are not.
@@ -877,7 +952,7 @@ export const createRuntimeEngine = ({
       }
       if (state.replyMessageId) publishMessage({ store, state, run, status: "streaming" })
       else {
-        const request = getActivePathMessage({ store, run })
+        const request = state.requestMessage
         if (request) ensureReply({ run, state, store, parentId: request.id })
       }
       return
@@ -926,8 +1001,11 @@ export const createRuntimeEngine = ({
         if (part.type === "tool_call") state.usage.toolCalls += 1
       }
       const changedPartIndex = index >= 0 ? index : state.parts.length - 1
-      state.dirtyParts.add(changedPartIndex)
       const changedPart = state.parts[changedPartIndex]
+      // A repeated frame can arrive after the first one was published, e.g. in a later provider slice;
+      // it changes nothing, so it must not write or broadcast the same part again.
+      if (previous && changedPart && !state.cancelRequested && isSamePart(previous, changedPart)) return
+      state.dirtyParts.add(changedPartIndex)
       if (state.cancelRequested && changedPart && "callId" in changedPart) {
         const pending =
           (changedPart.type === "tool_call" && changedPart.ok === null) ||
@@ -935,11 +1013,12 @@ export const createRuntimeEngine = ({
         state.parts[changedPartIndex] = tools.record(
           run,
           pending ? { ...changedPart, resolution: "cancelled_by_user", resolvedAt: Date.now() } : changedPart,
+          false,
+          false,
         )
       }
       if (!state.replyMessageId) {
-        const thread = store.getThread({ threadId: run.threadId })
-        const request = run.requestMessageId && thread ? getActivePathMessage({ store, run }) : null
+        const request = state.requestMessage
         if (request) ensureReply({ run, state, store, parentId: request.id })
       }
       const liveOutput =
@@ -1007,8 +1086,7 @@ export const createRuntimeEngine = ({
         scope: event.part.scope,
       })
       if (!state.replyMessageId) {
-        const thread = store.getThread({ threadId: run.threadId })
-        const request = run.requestMessageId && thread ? getActivePathMessage({ store, run }) : null
+        const request = state.requestMessage
         if (request) ensureReply({ run, state, store, parentId: request.id })
       }
       pendingApprovals.set(approvalId, {
@@ -1029,10 +1107,15 @@ export const createRuntimeEngine = ({
   }
 
   const getActivePathMessage = ({ store, run }: { store: StoreApi; run: Run }): Message | null => {
-    if (!run.requestMessageId) return null
-    if (store.getPathMessage) return store.getPathMessage({ threadId: run.threadId, messageId: run.requestMessageId })
+    const requestMessageId = run.requestMessageId
+    if (!requestMessageId) return null
 
-    return store.activePath({ threadId: run.threadId }).find((message) => message.id === run.requestMessageId) ?? null
+    const getRequestFromActivePath = () =>
+      store.getPathMessage
+        ? store.getPathMessage({ threadId: run.threadId, messageId: requestMessageId })
+        : (store.activePath({ threadId: run.threadId }).find((message) => message.id === requestMessageId) ?? null)
+
+    return runStage ? runStage("runtime_request_path_lookup", getRequestFromActivePath) : getRequestFromActivePath()
   }
 
   // Group coordination envelopes use the system role; failed member attempts alone leave no conversation to restore.
@@ -1180,6 +1263,8 @@ export const createRuntimeEngine = ({
         }) ?? undefined
     }
     const request = getActivePathMessage({ store, run })
+    // A branch switch during startup may move the visible leaf back when the first reply arrives.
+    state.requestMessage = request
     const resumedFrom = request?.role === "system" ? continuationReasonOf(request.text) : null
     const link = continuations.link(run.id)
     const originalRun = link ? persistence.getRun(link.originalRunId) : null
@@ -1268,7 +1353,7 @@ export const createRuntimeEngine = ({
     const mcp =
       bot.machine === "vm"
         ? { command: "/usr/local/bin/node", args: ["/usr/local/lib/touri/mcp-stdio.cjs", thread.id], env: {} }
-        : makeMcpToken(thread.id)
+        : await makeMcpToken(thread.id)
     const mcpFingerprint = sessionFingerprint({
       bot: {
         ...bot,
@@ -1387,7 +1472,7 @@ export const createRuntimeEngine = ({
     const result = await (async (): Promise<Awaited<ReturnType<ProviderAdapter["startTurn"]>>> => {
       let prepared: Awaited<ReturnType<import("@touri/contracts").VmRuntime["prepareTurn"]>> | undefined
       let flushEvents: (() => void) | undefined
-      let releaseLogin: (() => void) | undefined
+      let releaseLogin: (() => Promise<void> | void) | undefined
       try {
         if (bot.machine !== "vm" && bot.machine !== "cloud") {
           const login = await prepareLocalProviderLogin(kernel, bot, controller.signal, env.HOME)
@@ -1454,7 +1539,8 @@ export const createRuntimeEngine = ({
         flushEvents = safeEvents.flush
         // VM preparation registers its credentials with the same live registry.
         // Keep a single stream boundary for native and guest turns, before storage.
-        const onEvent = safeEvents
+        const onEvent = (event: ProviderEvent) =>
+          runStage ? runStage("provider_event_redaction", safeEvents, event) : safeEvents(event)
         const startTurn: ProviderAdapter["startTurn"] = prepared
           ? (args) => startVmTurn({ kernel, provider, args })
           : provider.startTurn
@@ -1523,7 +1609,7 @@ export const createRuntimeEngine = ({
         // A completion frame is advisory; drain trailing text before publishing a terminal reply.
         flushEvents?.()
         await prepared?.release()
-        releaseLogin?.()
+        await releaseLogin?.()
         if (deadline) clearTimeout(deadline)
       }
     })()
@@ -1583,6 +1669,7 @@ export const createRuntimeEngine = ({
             state.continueAfterApproval = false
             await finishLiveRun(
               run,
+              () => prepareFinalParts({ run, state, store, reason: "unknown" }),
               () => {
                 ensureReply({ run, state, store, parentId: run.requestMessageId ?? thread.activeLeafId ?? run.id })
                 finishParts({ run, state, reason: "unknown" })
@@ -1679,19 +1766,17 @@ export const createRuntimeEngine = ({
     continuing?: boolean
   }): Promise<void> => {
     const errorClass = refineErrorClass(reportedErrorClass, errorMessage)
+    const reason =
+      errorClass === "canceled"
+        ? "cancelled_by_user"
+        : errorClass === "app_restart"
+          ? "interrupted_by_restart"
+          : "failed"
     return finishLiveRun(
       run,
+      () => prepareFinalParts({ run, state, store, reason }),
       () => {
-        finishParts({
-          run,
-          state,
-          reason:
-            errorClass === "canceled"
-              ? "cancelled_by_user"
-              : errorClass === "app_restart"
-                ? "interrupted_by_restart"
-                : "failed",
-        })
+        finishParts({ run, state, reason })
         state.parts = state.parts.map((part, index) => {
           if (part.type !== "approval" || part.decision !== "pending") return part
           pendingApprovals.delete(part.approvalId)
@@ -1944,6 +2029,7 @@ export const createRuntimeEngine = ({
     const timer = setTimeout(
       () => {
         pendingContinuations.delete(run.id)
+        signalDrainChange()
         const ready = !shuttingDown && canStartContinuation(run, plan)
         if (!ready || !startContinuation({ run, plan })) abandonContinuation({ run, status: "failed" })
       },
@@ -2025,7 +2111,12 @@ export const createRuntimeEngine = ({
       updateRun(run, { status: "starting", startedAt: Date.now() })
       const execution = executeGoalTurn(run)
       executions.set(run.id, execution)
-      void execution.finally(() => executions.delete(run.id)).catch(() => {})
+      void execution
+        .finally(() => {
+          executions.delete(run.id)
+          signalDrainChange()
+        })
+        .catch(() => {})
     }
   }
 
@@ -2228,20 +2319,24 @@ export const createRuntimeEngine = ({
     decision,
     standing,
     message,
+    source,
   }: {
     approvalId: Id
     decision: "approved" | "denied"
     standing?: boolean
     message?: string
-  }): Promise<Result<object, "NOT_FOUND">> => {
+    source?: "card" | "notification"
+  }): Promise<Result<object, "NOT_FOUND" | "DENIED">> => {
     const resolution = decision === "approved" ? "allow" : message ? "answer" : "deny"
     const bridged = await approvalBridge.approve({
       approvalId,
       decision,
       ...(standing === undefined ? {} : { standing }),
       ...(message === undefined ? {} : { message }),
+      ...(source === undefined ? {} : { source }),
     })
     if (bridged.success) return bridged
+    if (bridged.errorCode === "DENIED") return bridged
     const pending = pendingApprovals.get(approvalId)
     if (!pending) return { success: false, errorCode: "NOT_FOUND", error: "Approval not found" }
     const currentRun = persistence.getRun(pending.runId)
@@ -2275,7 +2370,7 @@ export const createRuntimeEngine = ({
 
   const approvalBridge = createApprovalBridge({
     kernel,
-    onCard: (ctx, part) => {
+    onCard: async (ctx, part) => {
       const store = kernel.services.use("store.api")
       const run = ctx.runId ? persistence.getRun(ctx.runId) : null
       if (!store || !run || run.botId !== ctx.botId || run.threadId !== ctx.threadId) return false
@@ -2291,6 +2386,8 @@ export const createRuntimeEngine = ({
       if (!thread) return false
       ensureReply({ run, state, store, parentId: run.requestMessageId ?? thread.activeLeafId ?? run.id })
       publishMessage({ store, state, run, status: "streaming" })
+      if (state.replyMessageId)
+        await store.flushWritesAsync?.({ threadId: ctx.threadId, messageId: state.replyMessageId })
       return true
     },
   })
@@ -2473,6 +2570,7 @@ export const createRuntimeEngine = ({
     notices.deferred({
       botId: routine.botId,
       threadId: null,
+      routineId: routine.id,
       routineName: routine.name,
       reason: summary,
     })
@@ -2531,6 +2629,7 @@ export const createRuntimeEngine = ({
         notices.deferred({
           botId: routine.botId,
           threadId: null,
+          routineId: routine.id,
           routineName: routine.name,
           reason: `A rotina “${routine.name}” foi adiada porque a execução anterior ainda está em andamento.`,
         })
@@ -2558,6 +2657,8 @@ export const createRuntimeEngine = ({
     let threadId: Id | null = null
     if (routine.continuity === "main-thread") threadId = bot.mainThreadId
     else if (routine.continuity === "results-thread") threadId = routine.resultsThreadId
+    else if ((bot.automaticConversationMode ?? "main") === "main" && !group) threadId = bot.mainThreadId
+    else if ((bot.automaticConversationMode ?? "main") === "main" && group) threadId = routine.resultsThreadId
     if (!threadId && group) {
       const created = store.createThread({
         botId: group.memberIds[0] ?? bot.id,
@@ -2568,7 +2669,7 @@ export const createRuntimeEngine = ({
       if (!created.success)
         return { success: false, errorCode: "THREAD_NOT_FOUND", error: "Unable to create routine thread" }
       threadId = created.thread.id
-      if (routine.continuity === "results-thread")
+      if (routine.continuity === "results-thread" || (bot.automaticConversationMode ?? "main") === "main")
         persistence.updateRoutine({ ...routine, resultsThreadId: threadId, updatedAt: Date.now() })
     }
     if (!threadId) {
@@ -2679,14 +2780,28 @@ export const createRuntimeEngine = ({
   }
 
   const canDrainRun = (runId: Id): boolean => continuations.link(runId) !== null || continuations.isGroupRun(runId)
+  const hasDrainWork = (): boolean => executions.size > 0 || pendingContinuations.size > 0 || queued.some(canDrainRun)
+  const waitForDrainChange = (changed: Promise<void>): Promise<boolean> =>
+    new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(false), DRAIN_CHANGE_TIMEOUT_MS)
+      void changed.then(() => {
+        clearTimeout(timeout)
+        resolve(true)
+      })
+    })
 
   const waitForDrain = async (): Promise<void> => {
     await startupCleanup
-    while (!shuttingDown && (executions.size > 0 || pendingContinuations.size > 0 || queued.some(canDrainRun))) {
+    while (!shuttingDown && hasDrainWork()) {
+      const changed = drainChange.promise
       await drain()
-      await Promise.all(executions.values())
-      // Continuations can be scheduled after their provider execution finishes.
-      await new Promise<void>((resolve) => setTimeout(resolve, 10))
+      await Promise.all([...executions.values()])
+      if (!hasDrainWork()) return
+      if (pendingContinuations.size > 0) {
+        await changed
+        continue
+      }
+      if (!(await waitForDrainChange(changed))) return
     }
   }
 
@@ -2706,6 +2821,7 @@ export const createRuntimeEngine = ({
         abandonContinuation({ run: pending.run, status: "failed" })
     }
     shuttingDown = true
+    signalDrainChange()
     for (const [id, controller] of controllers) {
       const state = getState(id)
       state.completionError ??= { errorClass: "app_restart", errorMessage: "touri restarted" }
@@ -2721,7 +2837,7 @@ export const createRuntimeEngine = ({
   }
 
   // Both scans run `ps` asynchronously (#121); the record list is read before the first await.
-  const startupCleanup = Promise.all([reapProviderProcesses(kernel), reapOrphanShims(kernel.paths.runDir)])
+  const processCleanup = Promise.all([reapProviderProcesses(kernel), reapOrphanShims(kernel.paths.runDir)])
     .then(() => undefined)
     .catch((error) =>
       kernel.log({
@@ -2731,6 +2847,7 @@ export const createRuntimeEngine = ({
         data: { error: error instanceof Error ? error.message : String(error) },
       }),
     )
+  const startupCleanup = Promise.all([ownerWrite, processCleanup]).then(() => undefined)
   const recovered = new Set<Id>()
   const startupRecoveries: Array<Promise<void>> = []
   for (const run of persistence.listActiveRuns()) {
@@ -2814,8 +2931,8 @@ export const createRuntimeEngine = ({
   const recoveryStore = kernel.services.use("store.api")
   // Recovery repairs persisted history once. Terminal transitions already settle
   // their own tools; repeating recovery per turn rescans every previous result.
-  if (recoveryStore) tools.reconcile(recoveryStore)
-  const ready = Promise.allSettled([startupCleanup, ...startupRecoveries]).then((results) => {
+  const toolReconciliation = recoveryStore ? tools.reconcile(recoveryStore) : Promise.resolve()
+  const ready = Promise.allSettled([startupCleanup, ...startupRecoveries, toolReconciliation]).then((results) => {
     if (results.every((result) => result.status === "fulfilled")) return
     try {
       kernel.log({

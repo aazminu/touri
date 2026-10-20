@@ -11,9 +11,11 @@ import {
   type ToolResult,
 } from "@touri/contracts"
 import { createGroupRuntime } from "../groups/runtime"
+import { deviceSession } from "../kernel/device-session"
 import type { PerformanceStageRunner } from "../kernel/performance"
 import { buildChildEnv } from "../kernel/shell-env"
 import { getHostIdentity } from "../platform/host"
+import { createTeamTools } from "../teams/tools"
 import { createRuntimeEngine } from "./engine"
 import { listOpenCodeModels } from "./opencode/models"
 import { listProviderProfiles } from "./provider-profiles"
@@ -36,6 +38,7 @@ const overlapField = (value: unknown): Routine["overlap"] => (value === "queue" 
 const getRouteErrorStatus = (errorCode: string): number => {
   if (errorCode === "NOT_FOUND" || errorCode === "THREAD_NOT_FOUND") return 404
   if (errorCode === "BOT_PAUSED") return 409
+  if (errorCode === "DENIED") return 403
   if (errorCode === "RUNTIME_DRAINING") return 503
 
   return 400
@@ -121,6 +124,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
   kernel.services.provide("approvals.present", engine.approvalBridge.present)
   kernel.services.provide("approvals.approve", engine.approvalBridge.approve)
   kernel.services.provide("approvals.settle", engine.approvalBridge.settle)
+  kernel.services.provide("approvals.completeTeam", engine.approvalBridge.completeTeam)
   kernel.services.provide("runtime.activeRun", ({ threadId }) => engine.activeRun({ threadId }))
   kernel.services.provide("runtime.continueAfterApproval", engine.continueAfterApproval)
   kernel.services.provide("runtime.cancelBotTurns", groups.cancelBotTurns)
@@ -165,10 +169,26 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
       {
         method: "GET",
         path: "/runs",
-        handler: async () => ({
-          status: 200,
-          json: { runs: engine.getWorkRuns(), draining: kernel.services.use("runtime.isDraining")?.() ?? false },
-        }),
+        handler: async ({ signal }) => {
+          const runs = engine.getWorkRuns()
+          const person = deviceSession(signal)?.person
+          const visibleRuns =
+            !person || person.role === "admin"
+              ? runs
+              : (() => {
+                  const visibleIds = kernel.services.use("work.accessibleRunIds")?.({
+                    personId: person.id,
+                    channelIds: kernel.services.use("work.personChannelIds")?.(person.id) ?? [],
+                    runIds: runs.map((run) => run.id),
+                  })
+                  const visible = new Set(visibleIds ?? [])
+                  return runs.filter((run) => visible.has(run.id))
+                })()
+          return {
+            status: 200,
+            json: { runs: visibleRuns, draining: kernel.services.use("runtime.isDraining")?.() ?? false },
+          }
+        },
       },
       {
         method: "GET",
@@ -252,7 +272,16 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
       {
         method: "POST",
         path: "/approvals/:id",
-        handler: async ({ params, body }) => {
+        handler: async ({ params, body, signal }) => {
+          const person = deviceSession(signal)?.person
+          if (
+            person?.role === "member" &&
+            !kernel.services.use("work.canApprove")?.({
+              personId: person.id,
+              approvalId: params.id ?? "",
+            })
+          )
+            return routeError("DENIED", "Only the responsible person can approve this request")
           const decision = stringField(bodyRecord(body), "decision")
           if (decision !== "approved" && decision !== "denied")
             return routeError("INVALID_ARGS", "decision must be approved or denied")
@@ -260,6 +289,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
             approvalId: params.id ?? "",
             decision,
             standing: bodyRecord(body).standing === true,
+            source: "card",
           })
           return result.success ? { status: 200, json: {} } : routeError(result.errorCode, result.error)
         },
@@ -411,6 +441,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
   const approvalPrompt = createApprovalPromptHandler(engine)
   const registration = kernel.registerTools({
     tools: [
+      ...createTeamTools(kernel),
       { name: "coordinate_bots", group: "core", handler: ({ ctx, args }) => groups.askBot(ctx, args) },
       { name: "ask_all", group: "core", handler: ({ ctx, args }) => groups.askAll(ctx, args) },
       { name: "ask_bot", group: "core", handler: ({ ctx, args }) => groups.askBot(ctx, args) },

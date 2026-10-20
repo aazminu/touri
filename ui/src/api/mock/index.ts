@@ -55,6 +55,7 @@ const seed = seedJson as Seed
 const now = (): number => Date.now()
 
 const createBot = (input: Seed["bots"][number], index: number, projectId: Id | null): Bot => ({
+  teamBuilder: false,
   id: input.id,
   name: input.name,
   title: input.name === "mark" ? "Campaign lead" : input.name === "onb" ? "Operations" : "Research",
@@ -76,6 +77,7 @@ const createBot = (input: Seed["bots"][number], index: number, projectId: Id | n
   homeDir: `/Users/demo/Library/Application Support/touri/bots/${input.id}`,
   mainThreadId: null,
   browserEnabled: true,
+  automaticConversationMode: "main",
   browser: "touri",
   computerUse: false,
   machine: "local",
@@ -270,7 +272,12 @@ const defaultDoctor: DoctorReport = {
 }
 
 /** Optional demo states for screenshots and manual review, selected with `?mockScenario=` in the mock UI. */
-export type MockScenario = "resumed-turn" | "routine-conversation" | "interrupted-tasks"
+export type MockScenario =
+  | "resumed-turn"
+  | "routine-conversation"
+  | "interrupted-tasks"
+  | "group-context-missing"
+  | "message-edit-target"
 
 export const getRoutineConversationFixture = (): {
   thread: Thread
@@ -454,6 +461,32 @@ const getInterruptedTaskFixture = (): { messages: Message[]; runs: Run[] } => {
   }
 }
 
+const getGroupContextMissingFixture = (): { message: Message; run: Run } => {
+  const threadId = "thread-mark"
+  const runId = "run-group-context-missing"
+  const detail = "O grupo ou a conversa não existe mais. Este turno não foi executado."
+  const message: Message = {
+    ...createMessage({
+      id: "m-group-context-missing",
+      threadId,
+      role: "assistant",
+      text: "",
+      status: "failed",
+      runId,
+      parentId: "m2",
+    }),
+    parts: [{ type: "notice", level: "error", code: "run_failed", text: `group_context_missing: ${detail}` }],
+  }
+  const run: Run = {
+    ...createRun({ id: runId, threadId, botId: "bot-mark", status: "failed", errorClass: "group_context_missing" }),
+    requestMessageId: "m2",
+    replyMessageId: message.id,
+    errorMessage: detail,
+  }
+
+  return { message, run }
+}
+
 const importReport: ImportReport = {
   importId: "import-demo",
   origin: "/Users/demo/.legacy-app",
@@ -470,8 +503,15 @@ const importReport: ImportReport = {
 }
 
 export const createMockApi = ({ scenario }: { scenario?: MockScenario | null } = {}): MockApi => {
+  const getSeedMessage = (message: Seed["messages"][number]): Message => {
+    if (scenario !== "message-edit-target" || message.role !== "user") return createMessage(message)
+
+    return createMessage({ ...message, text: "Revise a campanha antes da reunião de planejamento." })
+  }
+
   const routineFixture = scenario === "routine-conversation" ? getRoutineConversationFixture() : null
   const interruptedFixture = scenario === "interrupted-tasks" ? getInterruptedTaskFixture() : null
+  const groupContextMissingFixture = scenario === "group-context-missing" ? getGroupContextMissingFixture() : null
   const project = createProject()
   const projects: Array<Project> = [project]
   // These local collections model server storage; deletion handlers replace them with the retained rows.
@@ -479,22 +519,27 @@ export const createMockApi = ({ scenario }: { scenario?: MockScenario | null } =
   let threads = seed.threads.map((thread) => {
     if (thread.id === routineFixture?.thread.id) return routineFixture.thread
     const saved = createThread(thread)
+    if (thread.id === "thread-mark" && groupContextMissingFixture)
+      return { ...saved, activeLeafId: groupContextMissingFixture.message.id }
     if (thread.id !== "thread-mark" || !interruptedFixture) return saved
     return { ...saved, activeLeafId: interruptedFixture.messages.at(-1)?.id ?? saved.activeLeafId }
   })
   let messages = [
-    ...seed.messages
-      .filter((message) => message.threadId !== routineFixture?.thread.id)
-      .map((message) => createMessage(message)),
+    ...seed.messages.filter((message) => message.threadId !== routineFixture?.thread.id).map(getSeedMessage),
     ...(routineFixture?.messages ?? []),
     ...(interruptedFixture?.messages ?? []),
+    ...(groupContextMissingFixture ? [groupContextMissingFixture.message] : []),
   ]
   const mem0Settings = new Map<string, import("@touri/contracts").Mem0Settings>()
   const goals = new Map<string, Goal>()
   const learning = new Map<string, BotLearning>()
   const machines = new Map<string, import("@touri/contracts").MachineState>()
   const networkPolicies = new Map<string, Record<string, unknown>>()
-  const initialRuns = [...(routineFixture ? [routineFixture.run] : []), ...(interruptedFixture?.runs ?? [])]
+  const initialRuns = [
+    ...(routineFixture ? [routineFixture.run] : []),
+    ...(interruptedFixture?.runs ?? []),
+    ...(groupContextMissingFixture ? [groupContextMissingFixture.run] : []),
+  ]
   let runs = new Map<string, Run>(initialRuns.map((run) => [run.id, run]))
   if (scenario === "resumed-turn") {
     const fixture = resumedTurnFixture()
@@ -669,7 +714,8 @@ export const createMockApi = ({ scenario }: { scenario?: MockScenario | null } =
     const key = String(route)
     if (key === "DELETE /bots/:id") {
       const bot = bots.find((bot) => bot.id === pathValues.id)
-      if (!bot || (input as ApiRoutes["DELETE /bots/:id"]["req"]).name !== bot.name)
+      if (!bot) throw new ApiError(404, "Bot não encontrado", "NOT_FOUND")
+      if ((input as ApiRoutes["DELETE /bots/:id"]["req"]).name !== bot.name)
         throw new Error("Digite o nome do bot para excluir.")
       const ownedThreads = new Set(threads.filter((thread) => thread.botId === bot.id).map((thread) => thread.id))
       messages = messages.filter((message) => !ownedThreads.has(message.threadId))
@@ -1120,7 +1166,10 @@ export const createMockApi = ({ scenario }: { scenario?: MockScenario | null } =
         bots.length,
         botInput.projectId ?? null,
       )
-      const storedBot: Bot = Object.assign(bot, botInput, { updatedAt: now() })
+      const storedBot: Bot = Object.assign(bot, botInput, {
+        teamBuilder: botInput.jobId === "team-builder",
+        updatedAt: now(),
+      })
       bots.push(storedBot)
       const thread = createThread({
         id: `thread-${bot.id}`,

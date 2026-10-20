@@ -1,4 +1,4 @@
-import { dlopen, read } from "bun:ffi"
+import { CString, dlopen, read } from "bun:ffi"
 import { randomBytes } from "node:crypto"
 import {
   closeSync,
@@ -14,8 +14,15 @@ import {
   realpathSync,
   writeSync,
 } from "node:fs"
-import { basename, dirname, relative, resolve, sep } from "node:path"
-import { closeOnExec, errnoSymbol, libcLibrary, quotaExceeded } from "../platform/posix"
+import { basename, dirname, join, relative, resolve, sep } from "node:path"
+import {
+  closeOnExec,
+  direntNameOffset,
+  errnoSymbol,
+  libcLibrary,
+  quotaExceeded,
+  removeDirectoryFlag,
+} from "../platform/posix"
 import { nativeFileOperation } from "../platform/windows-native"
 import { TouriError } from "./errors"
 
@@ -27,6 +34,11 @@ const openNative = () =>
     mkdirat: { args: ["i32", "cstring", "u32"], returns: "i32" },
     renameat: { args: ["i32", "cstring", "i32", "cstring"], returns: "i32" },
     unlinkat: { args: ["i32", "cstring", "i32"], returns: "i32" },
+    symlinkat: { args: ["cstring", "i32", "cstring"], returns: "i32" },
+    dup: { args: ["i32"], returns: "i32" },
+    fdopendir: { args: ["i32"], returns: "ptr" },
+    readdir: { args: ["ptr"], returns: "ptr" },
+    closedir: { args: ["ptr"], returns: "i32" },
     [errnoSymbol]: { args: [], returns: "ptr" },
   }).symbols
 let cachedNative: ReturnType<typeof openNative> | undefined
@@ -64,6 +76,34 @@ export const openWorkspaceDirectory = ({ root, path }: { root: string; path: str
   try {
     for (const part of path.split("/").filter(Boolean)) {
       const next = directoryAt(fd, part, false)
+      closeSync(fd)
+      fd = next
+    }
+    return fd
+  } catch (error) {
+    closeSync(fd)
+    throw error
+  }
+}
+
+/** Pins an existing workspace directory, or returns null when a path segment is absent. */
+export const openWorkspaceDirectoryIfPresent = ({ root, path }: { root: string; path: string }): number | null => {
+  if (process.platform === "win32")
+    throw new Error("Native directory-descriptor workspace access is not available on Windows")
+  if (path.includes("\0") || path.startsWith("/") || path.split("/").some((part) => part === ".."))
+    throw new TouriError("TOURI-E2000")
+  const absoluteRoot = resolve(root)
+  let fd = openSync(resolve(realpathSync(dirname(absoluteRoot)), basename(absoluteRoot)), directoryFlags)
+  try {
+    for (const part of path.split("/").filter(Boolean)) {
+      const next = openAt(fd, part, directoryFlags)
+      if (next < 0) {
+        if (errno() === 2) {
+          closeSync(fd)
+          return null
+        }
+        throw new TouriError("TOURI-E2000")
+      }
       closeSync(fd)
       fd = next
     }
@@ -418,10 +458,61 @@ export const removePrivateFile = ({ root, path }: { root: string; path: string }
   const name = parts.pop()
   if (!name) throw new TouriError("TOURI-E2000")
   withDirectory(root, parts, (fd) => {
-    validateTarget(fd, name)
     if (native().unlinkat(fd, cstring(name), 0) < 0 && errno() !== 2) throw failure()
     fsyncSync(fd)
   })
+}
+
+/** Remove a private tree through pinned directory handles without following links. */
+export const removePrivateTree = ({ root, path }: { root: string; path: string }): void => {
+  if (process.platform === "win32") {
+    nativeFileOperation("remove_tree", { root, path })
+    return
+  }
+  const parts = pathParts(root, path)
+  const name = parts.pop()
+  if (!name) throw new TouriError("TOURI-E2000")
+  if (!existsSync(join(root, ...parts, name))) return
+  const parent = openWorkspaceDirectory({ root, path: parts.join(sep) })
+  const remove = (directory: number, entry: string): void => {
+    const child = openAt(directory, entry, directoryFlags)
+    if (child < 0) {
+      const code = errno()
+      if (code === 2) return
+      if (code !== 20 && code !== 40 && code !== 62) throw failure()
+      if (native().unlinkat(directory, cstring(entry), 0) < 0 && errno() !== 2) throw failure()
+      return
+    }
+    try {
+      const duplicate = native().dup(child)
+      if (duplicate < 0) throw failure()
+      const stream = native().fdopendir(duplicate)
+      if (!stream) {
+        closeSync(duplicate)
+        throw failure()
+      }
+      try {
+        while (true) {
+          const item = native().readdir(stream)
+          if (!item) break
+          const childName = new CString(item, direntNameOffset).toString()
+          if (childName !== "." && childName !== "..") remove(child, childName)
+        }
+      } finally {
+        native().closedir(stream)
+      }
+      fsyncSync(child)
+    } finally {
+      closeSync(child)
+    }
+    if (native().unlinkat(directory, cstring(entry), removeDirectoryFlag) < 0 && errno() !== 2) throw failure()
+  }
+  try {
+    remove(parent, name)
+    fsyncSync(parent)
+  } finally {
+    closeSync(parent)
+  }
 }
 
 export const movePrivateFile = ({ root, from, to }: { root: string; from: string; to: string }): void => {
@@ -443,6 +534,28 @@ export const movePrivateFile = ({ root, from, to }: { root: string; from: string
       fsyncSync(sourceFd)
     }),
   )
+}
+
+export const replacePrivateSymlink = ({ root, path, target }: { root: string; path: string; target: string }): void => {
+  if (target.includes("\0")) throw new TouriError("TOURI-E2000")
+  if (process.platform === "win32") {
+    nativeFileOperation("replace_symlink", { root, path, target })
+    return
+  }
+  const parts = pathParts(root, path)
+  const name = parts.pop()
+  if (!name) throw new TouriError("TOURI-E2000")
+  withDirectory(root, parts, (directory) => {
+    const temporary = `.touri-${randomBytes(16).toString("hex")}.link`
+    if (native().symlinkat(cstring(target), directory, cstring(temporary)) < 0) throw failure()
+    try {
+      if (native().renameat(directory, cstring(temporary), directory, cstring(name)) < 0) throw failure()
+      fsyncSync(directory)
+    } catch (error) {
+      native().unlinkat(directory, cstring(temporary), 0)
+      throw error
+    }
+  })
 }
 
 /** SQLite retains its own WAL/transaction protocol; never rename a live database. */

@@ -1,5 +1,6 @@
 import { dirname, join } from "node:path"
 import { createKernel } from "../kernel"
+import { closeFileIoAsync } from "../kernel/async-files"
 import { ensurePrivateDirectory } from "../kernel/files"
 import { acquireRuntimeLock } from "../kernel/lifecycle"
 import { createAppPaths } from "../kernel/paths"
@@ -12,11 +13,12 @@ import { createSecretStore } from "./host/secretStore"
 import { startHeadlessStderr } from "./nativeStderr"
 import { remoteAccessWarning } from "./remoteAccessWarning"
 import { clearServeInfo, writeServeInfo } from "./serveInfo"
-import { registerServeShutdown } from "./serveShutdown"
+import { closeServeFiles, registerServeShutdown } from "./serveShutdown"
 import { exposeOnTailscale } from "./tailscale"
 import { cliVersion } from "./version"
-import { createWebGate } from "./web/gate"
+import { createWebGate, type MemberAuthorizer } from "./web/gate"
 import { resolveUiAssets } from "./web/uiAssets"
+import { initWorkMode } from "./work"
 
 const failedPairingsPerWindow = 8
 const pairingWindowMs = 60 * 1000
@@ -45,25 +47,28 @@ const startServer = async (options: ServeOptions, stopStderr: () => Promise<void
   const paths = createAppPaths({ appData: options.dataDir })
   const lease = await acquireRuntimeLock(paths, { parentPid: null })
   ensurePrivateDirectory({ root: paths.appData, path: paths.runDir })
-  const store = openAuthStore({ filename: join(options.dataDir, authDbName) })
+  const store = await openAuthStore({ filename: join(options.dataDir, authDbName) })
   const secrets = createSecretStore({ dir: options.dataDir })
   const ui = resolveUiAssets({ uiDir: options.uiDir, fallbackDir: join(dirname(process.execPath), "ui") })
+  const authorization: { authorize: MemberAuthorizer | null } = { authorize: null }
   const intercept = createWebGate({
     store,
     secrets,
     ui,
     trustedProxy: options.trustedProxy === true || options.tailscale,
     limiter: createRateLimiter({ maxFailures: failedPairingsPerWindow, windowMs: pairingWindowMs }),
+    authorizeMember: (input) => authorization.authorize?.(input) ?? null,
   })
   const runtime = createKernel({
     appData: options.dataDir,
     web: { hostname: options.host, port: options.port, intercept, host: createHeadlessHost({ secrets }) },
   })
+  initWorkMode({ kernel: runtime.kernel, authStore: store, secrets, authorization })
   await initModules(runtime)
   const port = runtime.handshake.port
   const exposed = options.tailscale ? await exposeOnTailscale({ localPort: port }) : null
   const url = exposed?.success ? exposed.url : null
-  writeServeInfo({
+  await writeServeInfo({
     dataDir: options.dataDir,
     info: {
       pid: process.pid,
@@ -97,13 +102,16 @@ const startServer = async (options: ServeOptions, stopStderr: () => Promise<void
     },
     log: runtime.kernel.log,
     finish: async () => {
-      runtime.emitHostNotification({ method: "app.willQuit", params: {} })
-      await runtime.kernel.services.use("vm.shutdown")?.()
-      clearServeInfo(options.dataDir)
-      await runtime.stop()
-      store.close()
-      lease.release()
-      await stopStderr()
+      try {
+        runtime.emitHostNotification({ method: "app.willQuit", params: {} })
+        await runtime.kernel.services.use("vm.shutdown")?.()
+        await clearServeInfo(options.dataDir)
+        await runtime.stop()
+        await store.close()
+        await stopStderr()
+      } finally {
+        await closeServeFiles({ closeFiles: closeFileIoAsync, releaseLease: () => lease.release() })
+      }
     },
   })
 }

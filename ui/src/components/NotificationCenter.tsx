@@ -5,6 +5,7 @@ import {
   type RespondBehavior,
   type Run,
 } from "@touri/contracts"
+import { isTeamCreateApprovalNotice } from "@touri/contracts/approval-summary"
 import { useEffect, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import { type ApprovalTarget, pendingApprovalTargets } from "../approvalNavigation"
@@ -90,6 +91,7 @@ const NotificationRow = ({
   inserted,
   messages,
   runs,
+  onReviewApproval,
 }: {
   item: NotificationRecord
   now: number
@@ -97,12 +99,14 @@ const NotificationRow = ({
   inserted: boolean
   messages: Message[]
   runs: Run[]
+  onReviewApproval?: ((target: ApprovalTarget) => void) | undefined
 }) => {
   const bot = useAvatarBot(item.botId)
   const [text, setText] = useState("")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>(null)
   const resolved = isResolvedNotification(item)
+  const teamProposal = isTeamCreateApprovalNotice(item)
   const approval = item.kind === "approval" ? approvalNotificationSummary(item, messages) : null
   const title =
     resolved && item.kind === "approval"
@@ -146,9 +150,11 @@ const NotificationRow = ({
   return (
     <li
       className={`notification-row ${resolved ? "resolved" : ""} ${inserted ? "motion-insert" : ""}`}
+      data-notification-id={item.id}
       data-kind={item.kind}
       data-testid="notification-row"
       data-avatar-hover
+      tabIndex={-1}
     >
       <BotAvatar
         bot={
@@ -206,7 +212,7 @@ const NotificationRow = ({
             <pre>{approval.technical}</pre>
           </details>
         )}
-        {!resolved && item.kind === "approval" && item.requestId && (
+        {!resolved && item.kind === "approval" && item.requestId && !teamProposal && (
           <div className="notification-buttons">
             <button
               type="button"
@@ -255,8 +261,17 @@ const NotificationRow = ({
         )}
         <div className="notification-links">
           {item.threadId && (
-            <button type="button" onClick={() => actions.open(item)}>
-              {t(item.kind === "approval" ? "Revisar" : "Open")}
+            <button
+              type="button"
+              onClick={() => {
+                if (teamProposal && item.requestId && item.threadId && onReviewApproval) {
+                  onReviewApproval({ threadId: item.threadId, approvalId: item.requestId })
+                  return
+                }
+                actions.open(item)
+              }}
+            >
+              {t(teamProposal ? "Review pending approval" : item.kind === "approval" ? "Revisar" : "Open")}
             </button>
           )}
           {!resolved && (
@@ -281,6 +296,7 @@ export const NotificationBell = ({
   runs = [],
   actions,
   now = Date.now(),
+  focusNotification = null,
   onOpenChange,
   onReviewApproval,
 }: {
@@ -289,6 +305,7 @@ export const NotificationBell = ({
   runs?: Array<Run>
   actions: NotificationActions
   now?: number
+  focusNotification?: { id: number; request: number } | null
   onOpenChange?: (open: boolean) => void
   onReviewApproval?: ((target: ApprovalTarget) => void) | undefined
 }) => {
@@ -304,6 +321,9 @@ export const NotificationBell = ({
     onOpenChange?.(open)
     return () => onOpenChange?.(false)
   }, [open, onOpenChange])
+  useEffect(() => {
+    if (focusNotification) setOpen(true)
+  }, [focusNotification])
   const navigationActions = {
     ...actions,
     recover: async (item: NotificationRecord, action: RecoveryAction) => {
@@ -396,6 +416,12 @@ export const NotificationBell = ({
       window.removeEventListener("resize", reposition)
     }
   }, [open])
+  useEffect(() => {
+    if (!open || !focusNotification) return
+    const row = document.querySelector<HTMLElement>(`[data-notification-id="${focusNotification.id}"]`)
+    row?.scrollIntoView?.({ block: "center", behavior: "instant" })
+    row?.focus({ preventScroll: true })
+  }, [focusNotification, open])
   return (
     <div className="notification-center" ref={container}>
       <button
@@ -498,6 +524,14 @@ export const NotificationBell = ({
                         inserted={inserted.has(String(item.id))}
                         messages={messages}
                         runs={runs}
+                        onReviewApproval={
+                          onReviewApproval
+                            ? (target) => {
+                                setOpen(false)
+                                onReviewApproval(target)
+                              }
+                            : undefined
+                        }
                       />
                     ))}
                   </ul>

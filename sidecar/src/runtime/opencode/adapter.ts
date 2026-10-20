@@ -5,6 +5,8 @@ import { startApiModelProxy } from "../../api-models/proxy"
 import { getApiModelEnv, getApiOpenCodeConfig, getApiRunError } from "../../api-models/runtime"
 import { getDelegation } from "../../groups/security"
 import { buildChildEnv } from "../../kernel"
+import { writePrivateFileAsync } from "../../kernel/async-files"
+import { getSavedBotModel } from "../../store/model"
 import { spawnFolderProvider } from "../folder-access"
 import { loadTurnImages } from "../loadTurnImages"
 import { withLocalTurnTemp } from "../local-turn-temp"
@@ -12,7 +14,7 @@ import { mcpStartupError } from "../mcp-startup"
 import { applyProviderPrivacy, cliTelemetryOff } from "../privacy"
 import { type ChildProcess, readProviderStderr, startLineReader } from "../provider-io"
 import { stopProviderChildren, trackProviderProcess } from "../provider-processes"
-import { asRecord, canonicalJson, classifyProviderError, writePrivateFile } from "../utils"
+import { asRecord, canonicalJson, classifyProviderError } from "../utils"
 import {
   credentialAuth,
   fullAccess,
@@ -55,7 +57,7 @@ export const createOpenCodeAdapter = ({
     const timer = setTimeout(() => child.kill("SIGKILL"), interruptGraceMs)
     void child.exited.finally(() => clearTimeout(timer)).catch(() => {})
   }
-  const startTurn = async (args: StartTurnArgs): Promise<StartTurnResult> => {
+  const startAttempt = async (args: StartTurnArgs): Promise<StartTurnResult> => {
     let child: ChildProcess | undefined
     let stopReader: (() => void) | undefined
     let sessionID = args.session?.externalSessionId ?? ""
@@ -98,7 +100,7 @@ export const createOpenCodeAdapter = ({
       const configPath = `${root}/opencode.json`
       const write =
         args.execution?.writeFile ??
-        ((file: { path: string; content: string }) => writePrivateFile({ root: kernel.paths.appData, ...file }))
+        ((file: { path: string; content: string }) => writePrivateFileAsync({ root: kernel.paths.appData, ...file }))
       const apiProxy = apiModel
         ? await startApiModelProxy({
             model: apiModel,
@@ -418,9 +420,17 @@ export const createOpenCodeAdapter = ({
       await cleanupApi?.().catch(() => {})
     }
   }
+  const startTurn: ProviderAdapter["startTurn"] = async (args) => {
+    const model = getSavedBotModel(args.bot.model)
+    if (!model.success) return model
+
+    const turnArgs = Object.assign({}, args, { bot: Object.assign({}, args.bot, { model: model.model }) })
+    return withLocalTurnTemp(kernel, turnArgs, startAttempt)
+  }
+
   return {
     provider: "opencode",
-    startTurn: (args) => withLocalTurnTemp(kernel, args, startTurn),
+    startTurn,
     detect: async () => {
       const env = buildChildEnv({ base: await kernel.shellEnv() })
       const binary = openCodeBinary(env, command)

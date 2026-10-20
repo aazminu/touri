@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto"
+import { join } from "node:path"
 import type { Kernel, MessagePart, ProviderAdapter, Result, RunErrorClass, StartTurnArgs } from "@touri/contracts"
 import { approvalOutcome } from "../../approvals/outcome"
 import { claudeApprovalKind, claudeApprovalPayload } from "../../approvals/payload"
 import { buildChildEnv } from "../../kernel"
+import { ensurePrivateDirectoryAsync, writePrivateFileAsync } from "../../kernel/async-files"
 import { redactStructured } from "../../kernel/redact"
+import { getSavedBotModel } from "../../store/model"
 import { commandOutputTail, createCommandOutput } from "../command-output"
-import { spawnFolderProvider, turnFolders } from "../folder-access"
+import { folderConfinementRequired, spawnFolderProvider, turnFolders } from "../folder-access"
 import { loadTurnImages } from "../loadTurnImages"
 import { withLocalTurnTemp } from "../local-turn-temp"
 import { mcpStartupError, touriMcpStartupFailed } from "../mcp-startup"
@@ -13,7 +16,7 @@ import { applyProviderPrivacy, cliTelemetryOff } from "../privacy"
 import { type ChildProcess, readProviderStderr, startLineReader, writeLine } from "../provider-io"
 import { stopProviderChildren, trackProviderProcess } from "../provider-processes"
 import { resolveProviderExecutable } from "../resolveProviderExecutable"
-import { asRecord, classifyProviderError, resolveExecutable, stringValue, writePrivateFile } from "../utils"
+import { asRecord, classifyProviderError, resolveExecutable, stringValue } from "../utils"
 import { claudeUserContent } from "./claudeUserContent"
 import { claudeSettings } from "./settings"
 
@@ -59,7 +62,7 @@ const claudeConfig = async ({
   root: string
   path: string
 }): Promise<void> => {
-  await (args.execution?.writeFile ?? writePrivateFile)({
+  await (args.execution?.writeFile ?? writePrivateFileAsync)({
     root,
     path,
     content: JSON.stringify({
@@ -133,12 +136,12 @@ export const createClaudeAdapter = ({
     Object.assign(env, userSettings.authEnv, args.env)
     Object.assign(env, applyProviderPrivacy(env, cliTelemetryOff(kernel)))
     await claudeConfig({ args, root: kernel.paths.appData, path: configPath })
-    await (args.execution?.writeFile ?? writePrivateFile)({
+    await (args.execution?.writeFile ?? writePrivateFileAsync)({
       root: kernel.paths.appData,
       path: settingsPath,
       content: JSON.stringify(userSettings.settings),
     })
-    await (args.execution?.writeFile ?? writePrivateFile)({
+    await (args.execution?.writeFile ?? writePrivateFileAsync)({
       root: kernel.paths.appData,
       path: systemPath,
       content: args.developerInstructions,
@@ -181,6 +184,11 @@ export const createClaudeAdapter = ({
     if (projectDataDir) commandArgs.push("--add-dir", projectDataDir)
     if (!args.execution && env.TMPDIR) commandArgs.push("--add-dir", env.TMPDIR)
     for (const folder of turnFolders(args)) commandArgs.push("--add-dir", folder.path)
+    if (process.platform !== "darwin" && folderConfinementRequired(args))
+      await ensurePrivateDirectoryAsync({
+        root: args.bot.homeDir,
+        path: join(args.bot.homeDir, ".touri-claude"),
+      })
     const spawned = spawnFolderProvider(kernel, args, {
       cmd: resolved.path,
       args: commandArgs,
@@ -495,7 +503,13 @@ export const createClaudeAdapter = ({
     return output
   }
 
-  const startTurn: ProviderAdapter["startTurn"] = (args) => withLocalTurnTemp(kernel, args, startAttempt)
+  const startTurn: ProviderAdapter["startTurn"] = async (args) => {
+    const model = getSavedBotModel(args.bot.model)
+    if (!model.success) return model
+
+    const turnArgs = Object.assign({}, args, { bot: Object.assign({}, args.bot, { model: model.model }) })
+    return withLocalTurnTemp(kernel, turnArgs, startAttempt)
+  }
 
   const answerApproval = async ({
     approvalId,

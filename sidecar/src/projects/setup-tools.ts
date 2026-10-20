@@ -11,8 +11,8 @@ import {
   type ToolResult,
 } from "@touri/contracts"
 import { getDelegation } from "../groups/security"
+import { createWorkspaceDirectoryAsync } from "../kernel/async-files"
 import { canonicalPath, excludedBotFolders, parseBotFolders, withinFolder } from "../kernel/bot-folders"
-import { createWorkspaceDirectory } from "../kernel/files"
 import { folderAccessUnavailable, refreshHostFolderAccess } from "../kernel/folder-capability"
 import { getHost } from "../platform/host"
 import { createCapabilityTools } from "./capability-tools"
@@ -90,6 +90,8 @@ export const createSetupTools = ({
 }): Array<ToolRegistration & { group: "project" }> => {
   const api = () => kernel.services.use("store.api")
   const self = (ctx: ToolContext): Bot | null => {
+    const isAdminRun = kernel.services.use("work.isAdminRun")
+    if (isAdminRun && (!ctx.runId || !isAdminRun(ctx.runId))) return null
     const bot = api()?.getBot({ botId: ctx.botId })
     // A peer's delegated request cannot persist changes outside its ceiling.
     if (ctx.signal.aborted || getDelegation(kernel, ctx.threadId)) return null
@@ -148,15 +150,16 @@ export const createSetupTools = ({
       },
     }
   }
-  const changed = (
+  const changed = async (
     bot: Bot,
     patch: Partial<Pick<Bot, "projectId" | "folders">>,
     text: string,
+    context: ToolContext,
     approvedContext?: ToolContext,
   ) => {
     const configure = kernel.services.use("bots.configureAccess")
     if (!configure) return denied("A configuração do bot está indisponível.")
-    const result = configure({ botId: bot.id, patch })
+    const result = await configure({ botId: bot.id, patch, ...(context.runId ? { runId: context.runId } : {}) })
     if (!result.success) return result
     const automatic =
       approvedContext && snapshot(bot) !== snapshot(result.bot)
@@ -342,7 +345,7 @@ export const createSetupTools = ({
           let linked = project
           if (!linked) {
             const id = kernel.newId()
-            const created = store.createProject({
+            const created = await store.createProject({
               id,
               name,
               path,
@@ -354,7 +357,7 @@ export const createSetupTools = ({
             if (!created.success) return created
             linked = created.project
           }
-          return changed(bot, { projectId: linked.id }, `Projeto ${name} (${path}) vinculado a este bot.`, ctx)
+          return changed(bot, { projectId: linked.id }, `Projeto ${name} (${path}) vinculado a este bot.`, ctx, ctx)
         } catch (error) {
           return {
             success: false,
@@ -462,14 +465,15 @@ export const createSetupTools = ({
             { path, access },
           ])
           if (!authorized()) return denied("O acesso não foi aprovado ou a configuração mudou.")
-          const result = changed(
+          const result = await changed(
             bot,
             { folders },
             `Acesso ${input.mode === "read" ? "de leitura" : "de leitura e escrita"} à pasta ${path} concedido a este bot.${target.missing ? ` Pasta ${target.path} criada.` : ""}`,
+            ctx,
             previousAccess !== access && (access === "read-write" || !previousAccess) ? ctx : undefined,
           )
           if (result.success && target.missing)
-            createWorkspaceDirectory({
+            await createWorkspaceDirectoryAsync({
               root: target.ancestor,
               path: relative(target.ancestor, target.path),
               identity: target,
@@ -496,7 +500,12 @@ export const createSetupTools = ({
         const bot = self(ctx)
         if (!bot) return denied("Somente o próprio bot pode alterar sua configuração.")
         const project = bot.projectId ? store.getProject(bot.projectId) : null
-        const result = changed(bot, { projectId: null }, `Projeto ${project?.name ?? "atual"} desvinculado deste bot.`)
+        const result = await changed(
+          bot,
+          { projectId: null },
+          `Projeto ${project?.name ?? "atual"} desvinculado deste bot.`,
+          ctx,
+        )
         if (result.success) notice(ctx, result.content?.find((part) => part.type === "text")?.text ?? "")
         return result
       },
@@ -519,10 +528,11 @@ export const createSetupTools = ({
         }
         if (!(bot.folders ?? []).some((folder) => folder.path === path))
           return { success: false, errorCode: "NOT_FOUND", error: "Pasta não encontrada nas permissões deste bot." }
-        const result = changed(
+        const result = await changed(
           bot,
           { folders: (bot.folders ?? []).filter((folder) => folder.path !== path) },
           `Acesso à pasta ${path} removido deste bot.`,
+          ctx,
         )
         if (result.success) notice(ctx, result.content?.find((part) => part.type === "text")?.text ?? "")
         return result

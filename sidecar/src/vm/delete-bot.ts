@@ -1,20 +1,28 @@
-import { CString, dlopen, read } from "bun:ffi"
 import type { Database } from "bun:sqlite"
-import { closeSync, constants, fsyncSync } from "node:fs"
+import { opendir } from "node:fs/promises"
 import { join, relative } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import type { Kernel, RegisteredErrorCode, RouteModule, VmRuntime } from "@touri/contracts"
 import { deletedBrowserSessionKey, removeBotSessionFile, removeBotSessionKey } from "../browser/sessionVault"
 import { createGroupStore } from "../groups/store"
-import { collectUnusedOutputBlobs } from "../kernel/data-maintenance"
+import { removeBotHomeDirectoryAsync, removePrivateFileAsync } from "../kernel/async-files"
+import {
+  collectUnusedOutputBlobs,
+  getStorageCollectionRetryDelay,
+  isStorageUpgradePending,
+} from "../kernel/data-maintenance"
 import { errorResponse, TouriError } from "../kernel/errors"
-import { openWorkspaceDirectory, removePrivateFile } from "../kernel/files"
 import { attachmentReferences } from "../kernel/output-blobs"
 import { botReplayRows, purgeBotReplay } from "../kernel/transcript-storage"
-import { direntNameOffset, errnoSymbol, libcLibrary, removeDirectoryFlag } from "../platform/posix"
-import { nativeFileOperation } from "../platform/windows-native"
 import { providerLoginAccount } from "./provider-login"
 
-export const deleteBotRoute = (kernel: Kernel, runtime: VmRuntime): RouteModule["routes"][number] => {
+const BOT_FILE_BATCH_SIZE = 16
+
+export const deleteBotRoute = (
+  kernel: Kernel,
+  runtime: VmRuntime,
+  collectBlobs = collectUnusedOutputBlobs,
+): RouteModule["routes"][number] => {
   const deleting = new Set<string>()
   return {
     method: "DELETE",
@@ -43,7 +51,7 @@ export const deleteBotRoute = (kernel: Kernel, runtime: VmRuntime): RouteModule[
           .filter((group) => group.memberIds.includes(botId))
           .map((group) => group.id)
         const attachments = await performDeletionStep("TOURI-E2014", () => deleteBotData(kernel, botId))
-        removeBotSessionFile(kernel, botId)
+        await removeBotSessionFile(kernel, botId)
         db.query(
           "INSERT INTO settings(key,value_json,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
         ).run(deletedBrowserSessionKey(botId), "true", Date.now())
@@ -55,7 +63,12 @@ export const deleteBotRoute = (kernel: Kernel, runtime: VmRuntime): RouteModule[
           kernel.services.use("storage.maintenance")?.scheduleSessionKeyRetry()
         }
         publishBotDeletion(kernel, botId, groups, groupIds)
-        await collectDeletedBotBlobs(kernel, attachments)
+        const collected = await collectDeletedBotBlobs(kernel, botId, attachments, collectBlobs)
+        if (!collected) {
+          kernel.services.use("storage.maintenance")?.start()
+          return errorResponse(new TouriError("TOURI-E2015"))
+        }
+
         return { status: 200, json: {} }
       } catch (error) {
         kernel.services.use("storage.maintenance")?.start()
@@ -102,13 +115,46 @@ const publishBotDeletion = (
   kernel.publish({ type: "bot.deleted", botId })
 }
 
-const collectDeletedBotBlobs = async (kernel: Kernel, attachments: Set<string>) => {
-  // The bot is already gone; the pending attachment list lets storage maintenance retry later.
+const collectDeletedBotBlobs = async (
+  kernel: Kernel,
+  botId: string,
+  attachments: Set<string>,
+  collectBlobs: typeof collectUnusedOutputBlobs,
+): Promise<boolean> => {
+  const db = kernel.db as Database
+  const marker = `storage.deleted-attachments:${botId}`
+  const timeoutMs = 5000
+  const signal = AbortSignal.timeout(timeoutMs)
   try {
-    await collectUnusedOutputBlobs(kernel.db as Database, kernel.paths.appData, Date.now(), null, attachments)
+    for (const attempt of [1, 2, 3]) {
+      if (isStorageUpgradePending(db)) return false
+
+      signal.throwIfAborted()
+      let deferred = false
+      await collectBlobs(
+        db,
+        kernel.paths.appData,
+        Date.now(),
+        () => sleep(0, undefined, { signal }),
+        attachments,
+        undefined,
+        () => {
+          deferred = true
+        },
+        signal,
+        timeoutMs,
+      )
+      // Shared and backup-pinned attachments intentionally survive a completed pass.
+      if (!deferred && !db.query("SELECT 1 FROM settings WHERE key = ?").get(marker)) return true
+      if (attempt === 3 || isStorageUpgradePending(db)) return false
+
+      // Concurrent writes can invalidate a scan; leave sustained contention to maintenance.
+      await sleep(getStorageCollectionRetryDelay(attempt), undefined, { signal })
+    }
   } catch (error) {
     kernel.log({ level: "warn", module: "vm", msg: kernel.redact(String(error)) })
   }
+  return false
 }
 
 const deleteBotLogins = async (kernel: Kernel, botId: string) => {
@@ -118,54 +164,62 @@ const deleteBotLogins = async (kernel: Kernel, botId: string) => {
   }
 }
 
-const deleteBotData = (kernel: Kernel, botId: string) => {
+const deleteBotData = async (kernel: Kernel, botId: string): Promise<Set<string>> => {
   const db = kernel.db as Database
-  return db
-    .transaction(() => {
-      detachBotGroupThreads(db, botId)
-      saveRemovedGroupMembers(kernel, botId)
-      createGroupStore(kernel).removeBot(botId)
-      const attachments = getBotAttachments(db, botId)
-      const files = getBotFilePaths(kernel, botId)
-      db.query(
-        "INSERT INTO settings(key,value_json,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
-      ).run(`storage.deleted-attachments:${botId}`, JSON.stringify([...attachments]), Date.now())
-      purgeBotReplay(db, botId)
-      deleteBotRunReferences(db, botId)
-      const threads = "SELECT id FROM threads WHERE bot_id = ?"
-      db.query(`DELETE FROM group_message_links WHERE source_thread_id IN (${threads})`).run(botId)
-      db.query(`UPDATE threads SET group_thread_id = NULL WHERE group_thread_id IN (${threads}) AND bot_id != ?`).run(
-        botId,
-        botId,
-      )
-      const threadTables = ["send_journal", "messages_fts", "transcript_retention"]
-      threadTables.forEach((table) => {
-        db.query(`DELETE FROM ${table} WHERE thread_id IN (${threads})`).run(botId)
-      })
-      // Open the existing retention guard only inside this scoped transaction.
-      db.query(
-        "UPDATE transcript_maintenance SET delete_before_id = (SELECT COALESCE(MAX(id), 0) FROM transcript_entries) WHERE id = 1",
-      ).run()
-      db.query(`DELETE FROM transcript_entries WHERE thread_id IN (${threads})`).run(botId)
-      db.query("UPDATE transcript_maintenance SET delete_before_id = 0 WHERE id = 1").run()
-      db.query(
-        "DELETE FROM notification_log WHERE notification_id IN (SELECT id FROM notifications WHERE bot_id = ?)",
-      ).run(botId)
-      db.query("DELETE FROM notifications WHERE bot_id = ?").run(botId)
-      db.query("DELETE FROM tool_calls WHERE bot_id = ?").run(botId)
-      const botTables = ["bot_mcp_servers", "cloud_runs", "cloud_machines"]
-      botTables.forEach((table) => {
-        db.query(`DELETE FROM ${table} WHERE bot_id = ?`).run(botId)
-      })
-      db.query("DELETE FROM processes WHERE vm_bot_id = ?").run(botId)
-      db.query("DELETE FROM browser_tabs WHERE owner_bot_id = ?").run(botId)
-      db.query("DELETE FROM settings WHERE key = ?").run(`approval-grants:${botId}`)
-      // Cascades remove only this bot's private threads, routines and group membership.
-      db.query("DELETE FROM bots WHERE id = ?").run(botId)
-      deleteBotFiles(kernel, botId, files)
-      return attachments
+  const attachments = getBotAttachments(db, botId)
+  try {
+    const files = await getBotFilePaths(kernel, botId)
+    await removeBotFilesInBatches(kernel.paths.appData, files)
+    const homes = [
+      relative(kernel.paths.appData, kernel.paths.botsDir),
+      "provider-homes/codex",
+      "provider-homes/codex-vault",
+    ]
+    for (const path of homes) await removeBotHomeDirectoryAsync({ root: kernel.paths.appData, path, botId })
+  } catch (cause) {
+    throw new TouriError("TOURI-E2013", { cause })
+  }
+  return db.transaction(() => {
+    detachBotGroupThreads(db, botId)
+    saveRemovedGroupMembers(kernel, botId)
+    createGroupStore(kernel).removeBot(botId)
+    db.query(
+      "INSERT INTO settings(key,value_json,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+    ).run(`storage.deleted-attachments:${botId}`, JSON.stringify([...attachments]), Date.now())
+    purgeBotReplay(db, botId)
+    deleteBotRunReferences(db, botId)
+    const threads = "SELECT id FROM threads WHERE bot_id = ?"
+    db.query(`DELETE FROM group_message_links WHERE source_thread_id IN (${threads})`).run(botId)
+    db.query(`UPDATE threads SET group_thread_id = NULL WHERE group_thread_id IN (${threads}) AND bot_id != ?`).run(
+      botId,
+      botId,
+    )
+    const threadTables = ["send_journal", "messages_fts", "transcript_retention"]
+    threadTables.forEach((table) => {
+      db.query(`DELETE FROM ${table} WHERE thread_id IN (${threads})`).run(botId)
     })
-    .immediate()
+    // Open the existing retention guard only inside this scoped transaction.
+    db.query(
+      "UPDATE transcript_maintenance SET delete_before_id = (SELECT COALESCE(MAX(id), 0) FROM transcript_entries) WHERE id = 1",
+    ).run()
+    db.query(`DELETE FROM transcript_entries WHERE thread_id IN (${threads})`).run(botId)
+    db.query("UPDATE transcript_maintenance SET delete_before_id = 0 WHERE id = 1").run()
+    db.query(
+      "DELETE FROM notification_log WHERE notification_id IN (SELECT id FROM notifications WHERE bot_id = ?)",
+    ).run(botId)
+    db.query("DELETE FROM notifications WHERE bot_id = ?").run(botId)
+    db.query("DELETE FROM tool_calls WHERE bot_id = ?").run(botId)
+    const botTables = ["bot_mcp_servers", "cloud_runs", "cloud_machines"]
+    botTables.forEach((table) => {
+      db.query(`DELETE FROM ${table} WHERE bot_id = ?`).run(botId)
+    })
+    db.query("DELETE FROM processes WHERE vm_bot_id = ?").run(botId)
+    db.query("DELETE FROM browser_tabs WHERE owner_bot_id = ?").run(botId)
+    db.query("DELETE FROM settings WHERE key = ?").run(`approval-grants:${botId}`)
+    // Cascades remove only this bot's private threads, routines and group membership.
+    db.query("DELETE FROM bots WHERE id = ?").run(botId)
+    return attachments
+  })()
 }
 
 const saveRemovedGroupMembers = (kernel: Kernel, botId: string) => {
@@ -255,14 +309,10 @@ const getBotAttachments = (db: Database, botId: string) => {
   return attachments
 }
 
-const getBotFilePaths = (kernel: Kernel, botId: string) => {
+const getBotFilePaths = async (kernel: Kernel, botId: string) => {
   const db = kernel.db as Database
   const threads = db.query("SELECT id FROM threads WHERE bot_id=?").all(botId) as { id: string }[]
-  const configurations = threads.flatMap((thread) =>
-    ["mcp.json", "settings.json", "system.md"].map((suffix) =>
-      join(kernel.paths.runDir, "claude", `${thread.id}.${suffix}`),
-    ),
-  )
+  const configurations = await getBotConfigurationPaths(kernel.paths.runDir, threads)
   const sessions = db
     .query(
       "SELECT rollout_path FROM provider_sessions WHERE thread_id IN (SELECT id FROM threads WHERE bot_id=?) AND rollout_path IS NOT NULL",
@@ -283,91 +333,27 @@ const getBotFilePaths = (kernel: Kernel, botId: string) => {
   return [...configurations, ...privateSessions]
 }
 
-const deleteBotFiles = (kernel: Kernel, botId: string, paths: string[]) => {
-  try {
-    paths.forEach((path) => {
-      removePrivateFile({ root: kernel.paths.appData, path })
-    })
-    removeBotHome(kernel, botId)
-  } catch (cause) {
-    throw new TouriError("TOURI-E2013", { cause })
-  }
-}
-
-const openNative = () =>
-  dlopen(libcLibrary, {
-    openat: { args: ["i32", "cstring", "i32"], returns: "i32" },
-    unlinkat: { args: ["i32", "cstring", "i32"], returns: "i32" },
-    dup: { args: ["i32"], returns: "i32" },
-    fdopendir: { args: ["i32"], returns: "ptr" },
-    readdir: { args: ["ptr"], returns: "ptr" },
-    closedir: { args: ["ptr"], returns: "i32" },
-    [errnoSymbol]: { args: [], returns: "ptr" },
-  }).symbols
-let cachedNative: ReturnType<typeof openNative> | undefined
-const native = () => (cachedNative ??= openNative())
-
-const errno = () => {
-  const pointer = native()[errnoSymbol]?.()
-  return pointer ? read.i32(pointer) : 0
-}
-const cstring = (value: string) => Buffer.from(`${value}\0`)
-
-// Walk and unlink relative to pinned directories. A bot-controlled symlink
-// cannot turn deletion of its home into deletion of a project/host directory.
-const removeBotHome = (kernel: Kernel, botId: string) => {
-  if (process.platform === "win32") {
-    if (!botId || botId === "." || botId === ".." || /[\\/\0]/.test(botId)) throw new Error("Pasta do bot inválida.")
-    nativeFileOperation("remove_tree", { root: kernel.paths.appData, path: join(kernel.paths.botsDir, botId) })
-    return
-  }
-  const parent = openWorkspaceDirectory({
-    root: kernel.paths.appData,
-    path: relative(kernel.paths.appData, kernel.paths.botsDir),
+const getBotConfigurationPaths = async (runDir: string, threads: { id: string }[]): Promise<string[]> => {
+  const directory = await opendir(join(runDir, "claude")).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null
+    throw error
   })
-  const remove = (directory: number, name: string) => {
-    const child = native().openat(
-      directory,
-      cstring(name),
-      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-    )
-    if (child < 0) {
-      const error = errno()
-      if (error === 2) return
-      if (error !== 20 && error !== 40 && error !== 62) throw new Error("Não foi possível remover a pasta do bot.")
-      if (native().unlinkat(directory, cstring(name), 0) !== 0 && errno() !== 2)
-        throw new Error("Não foi possível remover um arquivo do bot.")
-      return
-    }
-    try {
-      const duplicate = native().dup(child)
-      const stream = native().fdopendir(duplicate)
-      if (!stream) {
-        closeSync(duplicate)
-        throw new Error("Não foi possível ler a pasta do bot.")
-      }
-      try {
-        while (true) {
-          const entry = native().readdir(stream)
-          if (!entry) break
-          const entryName = new CString(entry, direntNameOffset).toString()
-          if (entryName !== "." && entryName !== "..") remove(child, entryName)
-        }
-      } finally {
-        native().closedir(stream)
-      }
-      fsyncSync(child)
-    } finally {
-      closeSync(child)
-    }
-    if (native().unlinkat(directory, cstring(name), removeDirectoryFlag) !== 0 && errno() !== 2)
-      throw new Error("Não foi possível remover a pasta do bot.")
+  if (!directory) return []
+
+  const names = new Set(
+    threads.flatMap((thread) => ["mcp.json", "settings.json", "system.md"].map((suffix) => `${thread.id}.${suffix}`)),
+  )
+  // Accumulate locally to avoid copying the matches on every directory entry.
+  const paths: string[] = []
+  for await (const entry of directory) {
+    if (names.has(entry.name)) paths.push(join(runDir, "claude", entry.name))
   }
-  try {
-    if (!botId || botId === "." || botId === ".." || /[\\/\0]/.test(botId)) throw new Error("Pasta do bot inválida.")
-    remove(parent, botId)
-    fsyncSync(parent)
-  } finally {
-    closeSync(parent)
+  return paths
+}
+
+const removeBotFilesInBatches = async (root: string, files: string[]): Promise<void> => {
+  for (let offset = 0; offset < files.length; offset += BOT_FILE_BATCH_SIZE) {
+    const batch = files.slice(offset, offset + BOT_FILE_BATCH_SIZE)
+    await Promise.all(batch.map((path) => removePrivateFileAsync({ root, path })))
   }
 }

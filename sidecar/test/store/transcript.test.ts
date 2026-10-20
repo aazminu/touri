@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite"
-import { expect, test } from "bun:test"
+import { afterEach, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -20,6 +20,12 @@ import { createRuntimePersistence } from "../../src/runtime/persistence"
 import { createToolResolutions } from "../../src/runtime/tool-resolutions"
 import { init as initStore } from "../../src/store"
 import { MAX_TRANSCRIPT_DELTA_BYTES } from "../../src/store/transcript-rejections"
+
+const regressionCleanups = new Set<() => Promise<void>>()
+afterEach(async () => {
+  for (const close of regressionCleanups) await close()
+  regressionCleanups.clear()
+})
 
 const seed = (db: Database): void => {
   db.exec(`INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at) VALUES ('b','Teste','codex','/tmp',1,1);
@@ -258,7 +264,7 @@ test("reconciliation restores completed results missing from the message and sum
       },
     })
     expect(reply.success).toBe(true)
-    tools.reconcile(f.store, "t")
+    await tools.reconcile(f.store, "t")
     const parts = f.store.activePath({ threadId: "t" }).at(-1)?.parts
     expect(parts).toMatchObject([
       { callId: "pending", resolution: "interrupted_by_restart" },
@@ -276,7 +282,7 @@ test("reconciliation restores completed results missing from the message and sum
     expect(summary).toContain("Resultado preservado")
     expect(summary).toContain("podem existir efeitos parciais")
     const seq = f.store.getThread({ threadId: "t" })?.updatedSeq
-    tools.reconcile(f.store, "t")
+    await tools.reconcile(f.store, "t")
     expect(f.store.getThread({ threadId: "t" })?.updatedSeq).toBe(seq)
     insertReply(f, "another-branch")
     expect(tools.summary(f.store, "t")).toBeNull()
@@ -521,7 +527,8 @@ test("v6 migration preserves a 2.5 MB history, branches, FTS and is repeatable",
 test("send journal is durable and one nonce produces exactly one message and run", async () => {
   const f = await fixture()
   try {
-    const request = input()
+    const sender = { id: "person-a", name: "Ana", avatarSeed: "seed-a" }
+    const request = { ...input(), sender }
     const first = f.store.sendMessage?.(request)
     expect(first?.status).toBe(201)
     const second = f.store.sendMessage?.(request)
@@ -529,6 +536,10 @@ test("send journal is durable and one nonce produces exactly one message and run
     expect(f.calls).toHaveLength(1)
     expect(f.db.query("SELECT status FROM send_journal").get()).toEqual({ status: "acked" })
     expect(f.db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 1 })
+    const storedSender = f.db.query("SELECT sender_json FROM messages WHERE thread_id = 't'").get() as {
+      sender_json: string
+    }
+    expect(JSON.parse(storedSender.sender_json)).toEqual(sender)
     expect(f.store.sendMessage?.({ ...request, text: "Diferente" }).status).toBe(409)
     const reopened = openDatabase({ filename: f.runtime.kernel.paths.db })
     expect(reopened.query("SELECT status, client_nonce FROM send_journal").get()).toEqual({
@@ -543,6 +554,25 @@ test("send journal is durable and one nonce produces exactly one message and run
   } finally {
     await f.close()
   }
+})
+
+test("the migrated owner can retry a legacy nonce without duplication or cross-person replay", async () => {
+  const f = await fixture()
+  regressionCleanups.add(f.close)
+  const request = input()
+  const first = f.store.sendMessage?.(request)
+  const owner = { id: "owner", name: "Owner", kind: "person" as const }
+  const member = { id: "member", name: "Member", kind: "person" as const }
+
+  const rejected = f.store.sendMessage?.({ ...request, sender: member })
+  const retried = f.store.sendMessage?.({ ...request, sender: owner })
+
+  expect(first?.status).toBe(201)
+  expect(rejected?.status).toBe(409)
+  expect(retried?.status).toBe(200)
+  expect(f.calls).toHaveLength(1)
+  expect(f.db.query("SELECT count(*) AS total FROM messages").get()).toEqual({ total: 1 })
+  expect(f.store.sendMessage?.({ ...request, text: "Changed", sender: owner }).status).toBe(409)
 })
 
 test("send journal preserves FIFO messages while the runtime drains", async () => {
@@ -828,7 +858,7 @@ test("restart resolves open tools and commands without changing already complete
     ])
     const tools = createToolResolutions(f.runtime.kernel)
     const versions = (f.db.query("SELECT MAX(seq) AS seq FROM transcript_entries").get() as { seq: number }).seq
-    tools.reconcile(f.store, "t")
+    await tools.reconcile(f.store, "t")
     expect(f.db.query("SELECT MAX(seq) AS seq FROM transcript_entries").get()).toEqual({ seq: versions })
     const completed = tools.record(run, {
       ...parts[0],
@@ -920,7 +950,7 @@ test("reconciliation closes calls persisted before an assistant message", async 
       )
       .run(run.id)
     f.persistence.saveRun({ ...run, status: "interrupted" })
-    tools.reconcile(f.store)
+    await tools.reconcile(f.store)
     expect(f.db.query("SELECT resolution FROM tool_resolutions").get()).toEqual({
       resolution: "interrupted_by_restart",
     })

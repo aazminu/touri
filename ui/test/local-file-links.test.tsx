@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react"
+import { fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createMockApi } from "../src/api/mock"
 import { MarkdownContent } from "../src/components/MarkdownContent"
@@ -96,7 +96,8 @@ describe("local files in chat Markdown", () => {
     for (const name of ["codificado", "arquivo", "/workspace/notas.md", "/workspace/nota final.txt"])
       expect(await screen.findByRole("button", { name })).toBeVisible()
     fireEvent.click(screen.getByRole("button", { name: "arquivo" }))
-    expect(await screen.findByText("Pronto")).toBeVisible()
+    const preview = await screen.findByRole("dialog", { name: "nota final.txt" })
+    expect(within(preview).getByText("Pronto")).toBeVisible()
     expect(request).toHaveBeenCalledWith(
       "GET /bots/:id/files/content",
       { path: "/workspace/nota final.txt" },
@@ -116,6 +117,19 @@ describe("local files in chat Markdown", () => {
     expect(error).toHaveTextContent(status === 403 ? "pastas permitidas" : "removido")
     expect(error).not.toHaveTextContent("NOT_FOUND")
     expect(screen.queryByRole("dialog")).toBeNull()
+  })
+
+  it("uses a familiar size in the error for files that are too large to preview", async () => {
+    const { evidence } = fixture(async () => {
+      throw new ApiError(413, '{"error":"ATTACHMENT_TOO_LARGE"}')
+    })
+    render(<MarkdownContent evidence={evidence} content="[notas.md](/workspace/notas.md)" />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "notas.md" }))
+
+    const error = await screen.findByRole("alert")
+    expect(error).toHaveTextContent("512 KB")
+    expect(error).not.toHaveTextContent(/KiB|MiB/)
   })
 
   it("keeps local paths inside touri even without a bot context", async () => {

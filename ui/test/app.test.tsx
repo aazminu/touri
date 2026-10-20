@@ -121,6 +121,7 @@ describe("WP9 frontend acceptance", () => {
     if (!screen.queryByRole("button", { name: "Preview do projeto" }))
       fireEvent.click(screen.getByRole("button", { name: "Painel do bot" }))
     fireEvent.click(screen.getByRole("button", { name: "Preview do projeto" }))
+    await screen.findByText("touri demo workspace", { selector: ".project-sidebar-heading strong" })
     fireEvent.click(await screen.findByRole("button", { name: "Menu do projeto" }))
     fireEvent.click(screen.getByRole("menuitem", { name: "Conectar projeto" }))
     expect(await screen.findByRole("dialog", { name: "Conectar projeto" })).toBeVisible()
@@ -336,7 +337,7 @@ describe("WP9 frontend acceptance", () => {
         },
       })
     })
-    const retry = await screen.findByRole("button", { name: "Tentar de novo" })
+    const retry = await screen.findByRole("button", { name: "Tentar novamente" })
     fireEvent.click(retry)
     await waitFor(() => expect(api.calls.some((call) => call.route === "POST /runs/:id/retry")).toBe(true))
   })

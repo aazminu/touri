@@ -99,8 +99,9 @@ export const createCapabilityTools = (
           )
         const configure = kernel.services.use("bots.configureAccess")
         if (!configure) return denied("A configuração do bot está indisponível.")
-        const result = configure({
+        const result = await configure({
           botId: bot.id,
+          ...(ctx.runId ? { runId: ctx.runId } : {}),
           patch:
             capability === "browser"
               ? { browserEnabled: true, browser: bot.machine === "vm" ? "machine" : "touri" }

@@ -39,7 +39,6 @@ import { GroupModal, GroupPanel } from "./components/Groups"
 import { InterruptedTasks } from "./components/InterruptedTasks"
 import {
   BotCreateModal,
-  BotModelModal,
   BotSettingsModal,
   DoctorModal,
   ImportWizard,
@@ -87,6 +86,7 @@ import { isRoutineConversation } from "./routineConversation"
 import { getTeamRoutineDraft, type RoutineDraft } from "./routineDraft"
 import { isFailureNotice } from "./sidebarAttention"
 import { useHost } from "./useHost"
+import { useNotificationSounds } from "./useNotificationSounds"
 import { RecoveryTasksContext, useRecoveryTasks } from "./useRecoveryTasks"
 import { useWebNavigation } from "./useWebNavigation"
 import { useWorkspace } from "./useWorkspace"
@@ -119,7 +119,6 @@ type ModalKind =
   | "project"
   | "settings"
   | "bot-settings"
-  | "bot-model"
   | "bot-permissions"
   | "bot-mcp"
   | null
@@ -222,7 +221,7 @@ const AppContent = ({ kernel }: AppProps) => {
   )
   const activeApi = api ?? unavailableApi
   useEffect(() => installComputerKillSwitch(activeApi, invokeCommand, setLocalNotice), [activeApi, invokeCommand])
-  const workspace = useWorkspace(activeApi, api !== null)
+  const workspace = useWorkspace(activeApi, api !== null, route.section === "bots" && route.screen === "chat")
   const { data, actions } = workspace
   const interruptedWork = useRecoveryTasks(api)
   const [recoveryOpen, setRecoveryOpen] = useState(false)
@@ -287,7 +286,11 @@ const AppContent = ({ kernel }: AppProps) => {
           setApi(
             createMockApi({
               scenario:
-                scenario === "resumed-turn" || scenario === "routine-conversation" || scenario === "interrupted-tasks"
+                scenario === "resumed-turn" ||
+                scenario === "routine-conversation" ||
+                scenario === "interrupted-tasks" ||
+                scenario === "group-context-missing" ||
+                scenario === "message-edit-target"
                   ? scenario
                   : null,
             }),
@@ -443,6 +446,11 @@ const AppContent = ({ kernel }: AppProps) => {
     isTauriRuntime() ? parseDeepLink(window.location.search) : null,
   )
   useEffect(() => {
+    const open = (event: Event) => setPendingLink((event as CustomEvent<DeepLink>).detail)
+    window.addEventListener("touri:open-conversation", open)
+    return () => window.removeEventListener("touri:open-conversation", open)
+  }, [])
+  useEffect(() => {
     if (!isTauriRuntime() || requestedComputer) return
     return installNativeDeepLinks({
       listen: (receive) => listen("deep-link", (event) => receive(event.payload)),
@@ -450,15 +458,6 @@ const AppContent = ({ kernel }: AppProps) => {
       onLink: setPendingLink,
     })
   }, [invokeCommand, requestedComputer])
-  useEffect(() => {
-    if (!pendingLink || !data.loaded || data.bots.length === 0) return
-    actions.selectLocation(pendingLink)
-    setRoute({ section: "bots", screen: "chat" })
-    setPendingLink(null)
-    if (pendingLink.requestId !== undefined)
-      void invokeCommand("deep_link_ack", { requestId: pendingLink.requestId }).catch(() => undefined)
-  }, [pendingLink, data.loaded, data.bots.length, actions, setRoute, invokeCommand])
-
   const restoreWebLocation = useCallback(
     (location: DeepLink, restoredRoute?: AppRoute): void => {
       actions.selectLocation(location)
@@ -475,22 +474,58 @@ const AppContent = ({ kernel }: AppProps) => {
   )
   useWebNavigation({
     enabled: !isTauriRuntime() && !requestedComputer,
-    ready: api !== null && data.loaded && !data.threadCreation,
+    ready: api !== null && data.loaded && data.threadCreation?.status !== "pending",
     bot: data.selectedBotId,
-    thread: data.selectedThreadId,
+    thread: data.threadCreation ? null : data.selectedThreadId,
     route,
     restore: restoreWebLocation,
     exists: webLocationExists,
   })
 
   const [approvalFocus, setApprovalFocus] = useState<(ApprovalTarget & { request: number }) | null>(null)
-  const reviewApproval = (target: ApprovalTarget): void => {
-    const owner = data.threads.find((thread) => thread.id === target.threadId)
-    if (!owner) return
-    actions.selectLocation({ bot: owner.botId, thread: owner.id })
-    setApprovalFocus((current) => ({ ...target, request: (current?.request ?? 0) + 1 }))
-    setRoute({ section: "bots", screen: "chat" })
-  }
+  const [notificationFocus, setNotificationFocus] = useState<{ id: number; request: number } | null>(null)
+  const reviewApproval = useCallback(
+    (target: ApprovalTarget): void => {
+      const owner = data.threads.find((thread) => thread.id === target.threadId)
+      if (!owner) return
+      actions.selectLocation({ bot: owner.botId, thread: owner.id })
+      setApprovalFocus((current) => ({ ...target, request: (current?.request ?? 0) + 1 }))
+      setRoute({ section: "bots", screen: "chat" })
+    },
+    [data.threads, actions.selectLocation, setRoute],
+  )
+  const openNeedsYou = useCallback(
+    (item: NotificationRecord): void => {
+      if (item.kind === "approval" && item.threadId && item.requestId) {
+        reviewApproval({ threadId: item.threadId, approvalId: item.requestId })
+        return
+      }
+
+      actions.selectLocation({ bot: item.botId, thread: item.threadId })
+      setRoute({ section: "bots", screen: "chat" })
+      setNotificationFocus((current) => ({ id: item.id, request: (current?.request ?? 0) + 1 }))
+    },
+    [reviewApproval, actions.selectLocation, setRoute],
+  )
+  useEffect(() => {
+    if (!pendingLink || !data.loaded || data.bots.length === 0) return
+    const notification = pendingLink.notificationId
+      ? data.notifications.find(
+          (item) =>
+            item.id === pendingLink.notificationId &&
+            (!pendingLink.bot || item.botId === pendingLink.bot) &&
+            (!pendingLink.thread || item.threadId === pendingLink.thread),
+        )
+      : undefined
+    if (notification) openNeedsYou(notification)
+    else {
+      actions.selectLocation(pendingLink)
+      setRoute({ section: "bots", screen: "chat" })
+    }
+    setPendingLink(null)
+    if (pendingLink.requestId !== undefined)
+      void invokeCommand("deep_link_ack", { requestId: pendingLink.requestId }).catch(() => undefined)
+  }, [pendingLink, data.loaded, data.bots.length, data.notifications, actions, setRoute, invokeCommand, openNeedsYou])
   const notificationActions = {
     recover: async (item: NotificationRecord, action: RecoveryAction): Promise<void> => {
       actions.selectLocation({ bot: item.botId, thread: item.threadId })
@@ -544,6 +579,18 @@ const AppContent = ({ kernel }: AppProps) => {
     }) ?? []
   const selectedProject = data.projects.find((project) => project.id === selectedBot?.projectId) ?? null
   const selectedMessages = data.messages.filter((message) => message.threadId === selectedThread?.id)
+  useNotificationSounds(
+    {
+      ready: data.loaded,
+      notifications: data.notifications,
+      messages: data.activityMessages,
+      bots: data.bots,
+      threads: data.threads,
+      preferences: data.settings?.notificationPreferences,
+      activeThreadId: section === "bots" && screen === "chat" && !modal ? (selectedThread?.id ?? null) : null,
+    },
+    invokeCommand,
+  )
   const { activePath, goalThread, goalRequest, goalBusy } = getGoalSelection({
     bot: selectedBot,
     thread: selectedThread,
@@ -627,15 +674,19 @@ const AppContent = ({ kernel }: AppProps) => {
     savedMessage: !!noticeRun?.requestMessageId,
     occurredAt: noticeRun?.finishedAt ?? noticeRecord?.createdAt,
   }
+  const failureShownInChat =
+    !!noticeRun?.replyMessageId &&
+    noticeRun.threadId === selectedThread?.id &&
+    selectedMessages.some((message) => message.id === noticeRun.replyMessageId && message.status === "failed")
   const showNotice = (message: string): void => {
     setLocalNotice(userFacingError(message))
     window.setTimeout(() => setLocalNotice(null), 4200)
   }
-  const openModal = (kind: ModalKind): void => {
+  const openModal = (kind: ModalKind, initialBotSection?: BotSettingsSectionId): void => {
     if (kind === "bot") setInitialJob(null)
     if (kind === "group") setGroupDraft(null)
     if (kind !== "settings" && kind !== "doctor" && kind !== "bot-settings") setSettingFocus(null)
-    if (kind === "bot-settings") setBotSettingsSection(undefined)
+    if (kind === "bot-settings") setBotSettingsSection(initialBotSection)
     if (kind === "project") setProjectLinkBotId(null)
     setModal(kind)
   }
@@ -787,6 +838,53 @@ const AppContent = ({ kernel }: AppProps) => {
     ) : modal === "import" ? (
       <ImportWizard bots={data.bots} api={api} onClose={closeModal} onNotice={showNotice} />
     ) : null
+  const workspaceNotice = (
+    <MotionPresence show={Boolean(notice) && !failureShownInChat} kind="toast">
+      {Boolean(notice) && !failureShownInChat && (
+        <div className={`notice-bar ${isErrorNotice ? "notice-error" : "notice-info"}`} role="status">
+          <span>◈</span>
+          {isErrorNotice ? (
+            <ErrorNotice
+              error={notice}
+              context={noticeContext}
+              onAction={async (action) => {
+                if (action === "retry") {
+                  if (noticeRecord) {
+                    await notificationActions.recover(noticeRecord, action)
+                    return
+                  }
+                  // A provider notice must not restart the local service or replay a mutation.
+                  await api.request("GET /health", {})
+                  setLocalNotice(null)
+                  actions.dismissNotice()
+                } else if (action === "login")
+                  runFailureAction({ kind: "setting", settingId: "providerLogin", label: "" })
+                else if (action === "storage" || action === "doctor") openModal("doctor")
+                else if (noticeRecord) await notificationActions.recover(noticeRecord, action)
+                else {
+                  // Without a task identity, refresh recorded state rather than guessing a target.
+                  await api.request("GET /workspace/activity", {})
+                  openModal("doctor")
+                }
+              }}
+            />
+          ) : typeof notice === "string" ? (
+            notice
+          ) : null}
+          <button
+            type="button"
+            onClick={() => {
+              setLocalNotice(null)
+              actions.dismissNotice()
+            }}
+            aria-label={t("Dismiss notice")}
+          >
+            ×
+          </button>
+        </div>
+      )}
+    </MotionPresence>
+  )
   // Keep creation mounted when the first bot's live event replaces onboarding with the workspace.
   const botModal = (
     <MotionPresence show={modal === "bot"} kind="modal">
@@ -853,12 +951,14 @@ const AppContent = ({ kernel }: AppProps) => {
         routines={botRoutines}
         actions={actions}
         onClose={closeModal}
+        onNotice={showNotice}
       />
     )
   if (data.bots.length === 0)
     return (
       <AvatarRuntimeProvider value={{ ...data, messages: data.activityMessages }}>
         {botModal}
+        {workspaceNotice}
         <OnboardingLanding
           host={host}
           onCreateBot={() => openModal("bot")}
@@ -879,6 +979,7 @@ const AppContent = ({ kernel }: AppProps) => {
       <AvatarRuntimeProvider value={{ ...data, messages: data.activityMessages }}>
         <FailureActionContext.Provider value={runFailureAction}>
           <main className="computer-window">
+            {workspaceNotice}
             <header>
               <h1>Computador de {selectedBot?.name ?? "bot"}</h1>
             </header>
@@ -930,52 +1031,7 @@ const AppContent = ({ kernel }: AppProps) => {
             )}
           </div>
         )}
-        {/* r8 motion: transient notice presence */}
-        <MotionPresence show={Boolean(notice)} kind="toast">
-          {Boolean(notice) && (
-            <div className={`notice-bar ${isErrorNotice ? "notice-error" : "notice-info"}`} role="status">
-              <span>◈</span>
-              {isErrorNotice ? (
-                <ErrorNotice
-                  error={notice}
-                  context={noticeContext}
-                  onAction={async (action) => {
-                    if (action === "retry") {
-                      if (noticeRecord) {
-                        await notificationActions.recover(noticeRecord, action)
-                        return
-                      }
-                      // A provider notice must not restart the local service or replay a mutation.
-                      await api.request("GET /health", {})
-                      setLocalNotice(null)
-                      actions.dismissNotice()
-                    } else if (action === "login")
-                      runFailureAction({ kind: "setting", settingId: "providerLogin", label: "" })
-                    else if (action === "storage" || action === "doctor") openModal("doctor")
-                    else if (noticeRecord) await notificationActions.recover(noticeRecord, action)
-                    else {
-                      // Without a task identity, refresh recorded state rather than guessing a target.
-                      await api.request("GET /workspace/activity", {})
-                      openModal("doctor")
-                    }
-                  }}
-                />
-              ) : typeof notice === "string" ? (
-                notice
-              ) : null}
-              <button
-                type="button"
-                onClick={() => {
-                  setLocalNotice(null)
-                  actions.dismissNotice()
-                }}
-                aria-label={t("Dismiss notice")}
-              >
-                ×
-              </button>
-            </div>
-          )}
-        </MotionPresence>
+        {workspaceNotice}
         {pendingReturnCount > 0 && !hasApprovalReminder && (
           <div className="notice-bar approval-notice" role="status">
             {t("Você tem {n} solicitações pendentes.", { n: pendingReturnCount })}
@@ -1040,7 +1096,9 @@ const AppContent = ({ kernel }: AppProps) => {
             onRecovery={openRecovery}
             recoveryCount={interruptedWork.tasks.filter((task) => task.notification.resolvedAt === null).length}
             notifications={data.notifications}
+            notificationFocus={notificationFocus}
             notificationActions={notificationActions}
+            onNeedsYou={openNeedsYou}
             onNotificationsOpen={setNotificationsOpen}
           />
           <Suspense fallback={<PageLoading />}>
@@ -1068,9 +1126,7 @@ const AppContent = ({ kernel }: AppProps) => {
               )}
               {screen === "preview" ? (
                 <PreviewScreen
-                  threadCreation={
-                    data.threadCreation ? (data.threadCreation.pending ? "pending" : "failed") : undefined
-                  }
+                  threadCreation={data.threadCreation?.status}
                   onRetryCreateThread={() => void actions.createThread()}
                   project={selectedProject}
                   processes={data.processes.filter((entry) => entry.spec.projectId === selectedProject?.id)}
@@ -1173,15 +1229,20 @@ const AppContent = ({ kernel }: AppProps) => {
                             goalRefreshRequest={goalRefreshRequest}
                             onGoalChange={notifyGoalChange}
                             composerKey={data.composerKey ?? undefined}
-                            threadCreation={
-                              data.threadCreation ? (data.threadCreation.pending ? "pending" : "failed") : undefined
-                            }
+                            threadCreation={data.threadCreation?.status}
                             onRetryCreateThread={() => void actions.createThread()}
+                            autoFocusComposer={Boolean(data.threadCreation)}
+                            onResumeBot={
+                              selectedBot ? () => actions.updateBot(selectedBot.id, { paused: false }) : undefined
+                            }
                             bot={selectedBot}
                             messages={selectedMessages}
                             runs={data.runs}
                             projects={data.projects}
-                            onOpenModel={() => openModal("bot-model")}
+                            onSaveModel={(model) =>
+                              selectedBot ? actions.updateBotModel(selectedBot.id, model) : Promise.resolve()
+                            }
+                            onNotice={showNotice}
                             onSelectProject={async (projectId) => {
                               if (selectedBot) await actions.updateBot(selectedBot.id, { projectId })
                             }}
@@ -1287,7 +1348,7 @@ const AppContent = ({ kernel }: AppProps) => {
                                 }}
                                 onSettings={() => openModal("bot-settings")}
                                 onRoutines={() => openBotRoutines(selectedBot.id)}
-                                onModel={() => openModal("bot-model")}
+                                onModel={() => openModal("bot-settings", "model")}
                                 onPermissions={() => openModal("bot-permissions")}
                                 onPreview={() => setScreen("preview")}
                                 onRole={(roleLine) => actions.updateBot(selectedBot.id, { roleLine })}
@@ -1352,15 +1413,6 @@ const AppContent = ({ kernel }: AppProps) => {
                   setRoute({ section: "bots", screen: "preview" })
                 }}
                 onNotice={showNotice}
-              />
-            )}
-            {modal === "bot-model" && selectedBot && (
-              <BotModelModal
-                key={`${selectedBot.id}:${selectedBot.provider}`}
-                api={api}
-                bot={selectedBot}
-                onSave={(model) => actions.updateBot(selectedBot.id, { model })}
-                onClose={closeModal}
               />
             )}
             {botSettingsModal}

@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test"
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { removeSmokeDirectory } from "../../../scripts/smoke-cleanup"
 import { buildChildEnv } from "../../src/kernel/shell-env"
 import { runHelperBlocking, stopHelperWorker } from "../../src/platform/helper-worker"
 
@@ -106,6 +107,6 @@ stopHelperWorker();if(result.exitCode!==0||result.stdout!=="compiled-worker-ok")
     ])
     expect({ code, errors, output: output.trim() }).toEqual({ code: 0, errors: "", output: "compiled-worker-ok" })
   } finally {
-    rmSync(root, { recursive: true, force: true })
+    await removeSmokeDirectory(root)
   }
 }, 60_000)

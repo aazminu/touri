@@ -448,6 +448,47 @@ test("draining finishes the active group turn and replays waiting turns in order
   expect(restarted.listRuns(other.id).some((run) => run.id === waiting[0]?.id)).toBe(true)
 })
 
+test("startup fails queued group turns whose group or conversation was removed", async () => {
+  for (const missing of ["group", "conversation"] as const) {
+    const f = await fixture()
+    const run: Run = {
+      id: f.host.kernel.newId(),
+      threadId: f.thread.id,
+      botId: f.bots[0]?.id ?? "",
+      provider: "codex",
+      trigger: "user",
+      requestMessageId: null,
+      replyMessageId: null,
+      externalTurnId: null,
+      status: "queued",
+      errorClass: null,
+      errorMessage: null,
+      usage: null,
+      routineRunId: null,
+      queuedAt: Date.now(),
+      startedAt: null,
+      finishedAt: null,
+    }
+    f.persistence.saveRun(run)
+    f.db.query("INSERT INTO group_turns VALUES(?,?,?)").run(run.id, f.group.id, JSON.stringify([]))
+    f.runtime.shutdown({ appRestart: true })
+    f.db.exec("PRAGMA foreign_keys = OFF")
+    if (missing === "group") f.db.query("DELETE FROM bot_groups WHERE id = ?").run(f.group.id)
+    else f.db.query("DELETE FROM threads WHERE id = ?").run(f.thread.id)
+    f.db.exec("PRAGMA foreign_keys = ON")
+
+    const restarted = createGroupRuntime(f.host.kernel, f.engine)
+    cleanups.unshift(() => restarted.shutdown())
+
+    expect(f.persistence.getRun(run.id)).toMatchObject({
+      status: "failed",
+      errorClass: "group_context_missing",
+      errorMessage: "O grupo ou a conversa não existe mais. Este turno não foi executado.",
+      finishedAt: expect.any(Number),
+    })
+  }
+})
+
 test("an active group finishes sequential members and delegated work during engine drain", async () => {
   const f = await fixture()
   f.runtime.shutdown()
@@ -1530,7 +1571,7 @@ test("a group routine posts its prompt into the group conversation and finishes 
   expect(f.persistence.getRun(finished?.runId ?? "")?.routineRunId).toBe(finished?.id ?? "")
 })
 
-test("a group routine follows the coordinator and creates its own group conversation on the first run", async () => {
+test("a group routine follows the coordinator and reuses its conversation in main mode", async () => {
   const f = await fixture()
   const group = f.data.save({ ...f.input, coordinatorBotId: f.bots[2]?.id ?? null }, f.group)
   const engine = routineEngine(f)
@@ -1544,6 +1585,19 @@ test("a group routine follows the coordinator and creates its own group conversa
   expect(thread).toMatchObject({ groupId: group.id, groupThreadId: null })
   expect(thread?.id).not.toBe(f.thread.id)
   expect(engine.listRoutines().find((r) => r.id === created.routine.id)?.resultsThreadId).toBe(thread?.id ?? "")
+
+  const next = engine.runRoutine({
+    routineId: created.routine.id,
+    triggerSource: "manual",
+    scheduledFor: Date.now() + 60_000,
+  })
+  if (!next.success) throw new Error(next.error)
+  await until(
+    () =>
+      engine.listRoutineRuns(created.routine.id).find((run) => run.id === next.routineRun.id)?.status === "succeeded",
+  )
+
+  expect(next.routineRun.threadId).toBe(thread?.id ?? null)
 })
 
 test("a group routine turn uses the routine timeout instead of the per-bot chat limit", async () => {

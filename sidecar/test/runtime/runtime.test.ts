@@ -1,13 +1,13 @@
 import type { Database } from "bun:sqlite"
-import { expect, setDefaultTimeout, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Bot, Message, StoreApi, Thread } from "@touri/contracts"
 import { t } from "../../../ui/src/i18n"
 import { createStandingGrantStore } from "../../src/approvals/grants"
 import { mcpStartupChecks } from "../../src/doctor/mcp"
 import { createKernel } from "../../src/kernel"
+import { flushFileIoAsync } from "../../src/kernel/async-files"
 import { openDatabase } from "../../src/kernel/db"
 import { init as initNotify } from "../../src/notify"
 import { createCodexAdapter } from "../../src/runtime/codex/adapter"
@@ -47,6 +47,14 @@ const waitFor = async (predicate: () => boolean, timeout = 10_000): Promise<void
   }
 }
 
+const seedThread = ({ database, thread }: { database: Database; thread: Thread }): void => {
+  database
+    .query(
+      `INSERT INTO threads (id, bot_id, kind, title, active_leaf_id, unread, usage_json, source, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, 0, '{}', 'local', ?, ?)`,
+    )
+    .run(thread.id, thread.botId, thread.kind, thread.title, thread.createdAt, thread.updatedAt)
+}
+
 const seedDatabase = ({ database, bot, thread }: { database: Database; bot: Bot; thread: Thread }): void => {
   database
     .query(
@@ -66,11 +74,7 @@ const seedDatabase = ({ database, bot, thread }: { database: Database; bot: Bot;
       bot.createdAt,
       bot.updatedAt,
     )
-  database
-    .query(
-      `INSERT INTO threads (id, bot_id, kind, title, active_leaf_id, unread, usage_json, source, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, 0, '{}', 'local', ?, ?)`,
-    )
-    .run(thread.id, thread.botId, thread.kind, thread.title, thread.createdAt, thread.updatedAt)
+  seedThread({ database, thread })
 }
 
 const fixture = async ({
@@ -79,16 +83,19 @@ const fixture = async ({
   maxConcurrentRuns = 3,
   interruptGraceMs,
   routineTimeoutMs,
+  automaticConversationMode = "main",
 }: {
   provider?: Bot["provider"]
   scenario?: Record<string, unknown>
   maxConcurrentRuns?: number
   interruptGraceMs?: number
   routineTimeoutMs?: number
+  automaticConversationMode?: Bot["automaticConversationMode"]
 } = {}): Promise<Fixture> => {
-  const root = mkdtempSync(join(tmpdir(), "touri-wp3-"))
-  // Provider fixtures live outside app data, just like installed user CLIs.
-  const assets = mkdtempSync(join(tmpdir(), "touri-provider-fixture-"))
+  // Keep runtime data and provider logs under a disposable repository fixture.
+  const root = mkdtempSync(join(repoRoot, "sidecar", "test", ".runtime-fixture-"))
+  const assets = join(root, "bots", "bot-runtime", "provider-fixture")
+  mkdirSync(assets, { recursive: true })
   const fakePath = join(assets, "fake-codex")
   const scenario = join(assets, "scenario.json")
   const logPath = join(assets, "provider.log")
@@ -114,6 +121,7 @@ const fixture = async ({
   runtime.kernel.spawnTree = fakeProviderSpawn(runtime.kernel.spawnTree, fakePath, scenario)
   const timestamp = Date.now()
   const bot: Bot = {
+    teamBuilder: false,
     id: "bot-runtime",
     name: "runtime",
     title: null,
@@ -132,6 +140,7 @@ const fixture = async ({
     homeDir: join(root, "bots", "bot-runtime"),
     mainThreadId: "thread-runtime",
     browserEnabled: true,
+    automaticConversationMode,
     browser: "touri",
     computerUse: false,
     machine: "local",
@@ -175,7 +184,13 @@ const fixture = async ({
   mkdirSync(bot.homeDir, { recursive: true })
   writeFileSync(join(bot.homeDir, "MEMORY.md"), "Memory fixture\n")
   seedDatabase({ database: runtime.kernel.db as Database, bot, thread })
-  const store = createTestStore({ bot, thread, publish: runtime.kernel.publish })
+  const database = runtime.kernel.db as Database
+  const store = createTestStore({
+    bot,
+    thread,
+    publish: runtime.kernel.publish,
+    onCreateThread: (created) => seedThread({ database, thread: created }),
+  })
   runtime.kernel.services.provide("store.api", store)
   const engine = createRuntimeEngine({
     kernel: runtime.kernel,
@@ -196,7 +211,6 @@ const closeFixture = async (value: Fixture): Promise<void> => {
   await value.engine.shutdown()
   await value.runtime.stop()
   rmSync(value.root, { recursive: true, force: true })
-  rmSync(value.assets, { recursive: true, force: true })
 }
 
 test("pausing a cached routine prevents cron attempts and survives runtime replacement", async () => {
@@ -677,6 +691,7 @@ test("Codex process failures show coded chat errors with the sanitized provider 
     const reply = value.store.messages.get(result.run.replyMessageId ?? "")
     expect(JSON.stringify(reply?.parts)).toContain("TOURI-E3002")
     expect(JSON.stringify(reply?.parts)).toContain(`Detalhe do provedor: Codex exited (17): ${detail}`)
+    await flushFileIoAsync()
     expect(readFileSync(join(value.root, "logs", "sidecar.log"), "utf8")).toContain(detail)
   } finally {
     await closeFixture(value)
@@ -750,7 +765,8 @@ test.each([
     const reply = [...value.store.messages.values()].find((message) => message.id === result.run.replyMessageId)
     expect(JSON.stringify(reply?.parts)).toContain("TOURI-E3001")
     expect(JSON.stringify(reply?.parts)).not.toContain("expired Codex login")
-    expect(readFileSync(join(value.root, "logs", "sidecar.log"), "utf8")).toContain("expired Codex login")
+    await flushFileIoAsync()
+    expect(readFileSync(join(value.root, "logs", "sidecar.log"), "utf8")).toContain("Refresh the session")
   } finally {
     await closeFixture(value)
   }
@@ -867,6 +883,8 @@ test.serial("tool publications persist only changed parts and preserve completed
         { type: "delta", delta: prose },
         { type: "command", callId: "first", command: "echo ok", output: "ok" },
         { type: "command", callId: "second", command: "cat result.txt", output },
+        // Force the repeated completed frame into a later provider slice, after the first one is published.
+        { type: "sleep" },
         { type: "command", callId: "second", command: "cat result.txt", output: "" },
         { type: "delta", delta: "Pronto." },
         { type: "complete" },
@@ -901,10 +919,16 @@ test.serial("tool publications persist only changed parts and preserve completed
       await waitFor(() => terminal(queued.run.status))
       expect(queued.run.status).toBe("succeeded")
       const published = patches.flatMap(({ parts }) => parts)
-      expect(published.map(({ part }) => ("callId" in part ? part.callId : part.type))).toEqual(["first", "second"])
+      const first = published.filter(({ part }) => "callId" in part && part.callId === "first")
+      const second = published.filter(({ part }) => "callId" in part && part.callId === "second")
+
+      // A repeated completed frame in a later slice changes nothing; unchanged parts must stay absent.
+      expect(first).toHaveLength(1)
+      expect(second).toHaveLength(1)
+      expect(published).toHaveLength(first.length + second.length)
       expect(JSON.stringify(patches)).not.toContain(prose)
       expect(JSON.stringify(patches)).not.toContain(output)
-      const completed = published.find(({ part }) => "callId" in part && part.callId === "second")?.part
+      const completed = second.at(-1)?.part
       expect(completed).toMatchObject({ outputBytes: Buffer.byteLength(output), outputTail: "" })
       expect(updates).toHaveLength(1)
       expect(updates[0]?.patch.status).toBe("complete")
@@ -1824,6 +1848,183 @@ test.serial("scheduled results-thread routines keep the same thread across slots
     expect(threads[0]?.thread_id).toBe(threads[1]?.thread_id)
   } finally {
     await closeFixture(value)
+  }
+})
+
+describe("30 automatic routine runs", () => {
+  let value: Fixture
+
+  beforeEach(async () => {
+    value = await fixture({ scenario: { events: [{ type: "delta", delta: "result" }, { type: "complete" }] } })
+  })
+
+  afterEach(async () => closeFixture(value))
+
+  test.serial(
+    "default automatic runs resume the main conversation without resending its history",
+    async () => {
+      writeFileSync(
+        value.scenario,
+        JSON.stringify({
+          logPath: value.logPath,
+          requestLogPath: join(value.assets, "requests.log"),
+          events: [{ type: "delta", delta: "result" }, { type: "complete" }],
+        }),
+      )
+      addUser(value.store, value.thread, "Earlier conversation from the main thread")
+      const created = value.engine.createRoutine({
+        input: {
+          botId: value.bot.id,
+          name: "Daily check",
+          prompt: "Review only the new items.",
+          cron: "*/5 * * * *",
+          timezone: "America/Sao_Paulo",
+          enabled: true,
+          continuity: "new-thread",
+          resultsThreadId: null,
+          groupId: null,
+          timeoutMinutes: 30,
+          overlap: "skip",
+          catchUpMinutes: 30,
+        },
+        forceDisabled: false,
+      })
+      if (!created.success) throw new Error(created.error)
+
+      const slots = Array.from({ length: 30 }, (_, index) => Date.now() + index * 5_000)
+      for (const scheduledFor of slots) {
+        const succeededRuns = value.engine.listRoutineRuns(created.routine.id)
+        const started = value.engine.runRoutine({ routineId: created.routine.id, triggerSource: "cron", scheduledFor })
+        if (!started.success) throw new Error(started.error)
+        await waitFor(
+          () =>
+            value.engine.listRoutineRuns(created.routine.id).filter((run) => run.status === "succeeded").length ===
+            succeededRuns.filter((run) => run.status === "succeeded").length + 1,
+        )
+      }
+
+      const threadIds = value.engine.listRoutineRuns(created.routine.id).map((run) => run.threadId)
+      expect(threadIds).toEqual(slots.map(() => value.thread.id))
+      expect([...value.store.threads.keys()]).toEqual([value.thread.id])
+      const requests = readFileSync(join(value.assets, "requests.log"), "utf8")
+        .trim()
+        .split("\n")
+        .map(
+          (line) => JSON.parse(line) as { method: string; params?: { input?: Array<{ type: string; text?: string }> } },
+        )
+      const requestTexts = requests
+        .filter((request) => request.method === "turn/start")
+        .map((request) =>
+          (request.params?.input ?? [])
+            .flatMap((part) => (part.type === "text" && part.text ? [part.text] : []))
+            .join("\n"),
+        )
+
+      expect(requestTexts).toHaveLength(30)
+      expect(requests.filter((request) => request.method === "thread/start")).toHaveLength(1)
+      expect(requests.filter((request) => request.method === "thread/resume")).toHaveLength(29)
+      expect(requestTexts[0]).toContain("Earlier conversation from the main thread")
+      expect(requestTexts.slice(1)).toEqual(slots.slice(1).map(() => "Review only the new items."))
+      expect(readFileSync(value.logPath, "utf8")).toContain("thread/resume")
+    },
+    60_000,
+  )
+})
+
+test.serial("task mode keeps one routine conversation per run", async () => {
+  const value = await fixture({ automaticConversationMode: "task" })
+  try {
+    const created = value.engine.createRoutine({
+      input: {
+        botId: value.bot.id,
+        name: "Task routine",
+        prompt: "Run once per task.",
+        cron: "*/5 * * * *",
+        timezone: "America/Sao_Paulo",
+        enabled: true,
+        continuity: "new-thread",
+        resultsThreadId: null,
+        groupId: null,
+        timeoutMinutes: 30,
+        overlap: "skip",
+        catchUpMinutes: 30,
+      },
+      forceDisabled: false,
+    })
+    if (!created.success) throw new Error(created.error)
+
+    for (const scheduledFor of [Date.now(), Date.now() + 5_000]) {
+      const started = value.engine.runRoutine({ routineId: created.routine.id, triggerSource: "cron", scheduledFor })
+      if (!started.success) throw new Error(started.error)
+      const succeededRuns = value.engine.listRoutineRuns(created.routine.id)
+      await waitFor(
+        () =>
+          value.engine.listRoutineRuns(created.routine.id).filter((run) => run.status === "succeeded").length ===
+          succeededRuns.filter((run) => run.status === "succeeded").length + 1,
+      )
+    }
+
+    const threadIds = value.engine.listRoutineRuns(created.routine.id).map((run) => run.threadId)
+    expect(threadIds).toHaveLength(2)
+    expect(threadIds[0]).not.toBe(threadIds[1])
+  } finally {
+    await closeFixture(value)
+  }
+})
+
+test.serial("routine continuity overrides the bot mode only when explicitly selected", async () => {
+  for (const automaticConversationMode of ["main", "task"] as const) {
+    for (const continuity of ["new-thread", "main-thread", "results-thread"] as const) {
+      const value = await fixture({ automaticConversationMode })
+      try {
+        const created = value.engine.createRoutine({
+          input: {
+            botId: value.bot.id,
+            name: `${automaticConversationMode} ${continuity}`,
+            prompt: "Run using the selected conversation rule.",
+            cron: "*/5 * * * *",
+            timezone: "America/Sao_Paulo",
+            enabled: true,
+            continuity,
+            resultsThreadId: null,
+            groupId: null,
+            timeoutMinutes: 30,
+            overlap: "skip",
+            catchUpMinutes: 30,
+          },
+          forceDisabled: false,
+        })
+        if (!created.success) throw new Error(created.error)
+
+        for (const scheduledFor of [Date.now(), Date.now() + 5_000]) {
+          const succeededRuns = value.engine.listRoutineRuns(created.routine.id)
+          const started = value.engine.runRoutine({
+            routineId: created.routine.id,
+            triggerSource: "cron",
+            scheduledFor,
+          })
+          if (!started.success) throw new Error(started.error)
+          await waitFor(
+            () =>
+              value.engine.listRoutineRuns(created.routine.id).filter((run) => run.status === "succeeded").length ===
+              succeededRuns.filter((run) => run.status === "succeeded").length + 1,
+          )
+        }
+
+        const threadIds = value.engine.listRoutineRuns(created.routine.id).map((run) => run.threadId)
+        expect(threadIds).toHaveLength(2)
+        if (continuity === "new-thread" && automaticConversationMode === "task") {
+          expect(threadIds[0]).not.toBe(threadIds[1])
+        } else {
+          expect(threadIds[0]).toBe(threadIds[1])
+        }
+        if (continuity === "main-thread" || (continuity === "new-thread" && automaticConversationMode === "main"))
+          expect(threadIds).toEqual([value.thread.id, value.thread.id])
+        if (continuity === "results-thread") expect(threadIds[0]).not.toBe(value.thread.id)
+      } finally {
+        await closeFixture(value)
+      }
+    }
   }
 })
 
