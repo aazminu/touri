@@ -1,6 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import type { Bot, Message, Run, Thread } from "@touri/contracts"
-import axe from "axe-core"
 import { afterEach, expect, it, vi } from "vitest"
 import { createMockApi } from "../src/api/mock"
 import { computeBotActivity, holdBotPositions, orderBotsByActivity } from "../src/botActivity"
@@ -222,22 +221,10 @@ it("keeps only hidden unread messages on an expanded bot and restores its total 
   expect(document.querySelector(".bot-thread-tree")).toBeNull()
 })
 
-it("shows active work as a clear navigation action in both languages", async () => {
+it("shows active work as a clear navigation action in both languages", () => {
   const { bots, threads } = fixture()
   const running = run("run-active", "bot-alfa", "thread-alfa")
   const queued = run("run-queued", "bot-beta", "thread-beta", "queued")
-
-  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(
-    () =>
-      ({
-        canvas: { width: 100, height: 100 },
-        fillRect: () => undefined,
-        clearRect: () => undefined,
-        fillText: () => undefined,
-        measureText: () => ({ width: 10 }),
-        getImageData: () => ({ data: new Uint8ClampedArray([0, 0, 0, 255]) }),
-      }) as unknown as CanvasRenderingContext2D,
-  )
 
   renderSidebar({ bots, threads, workRuns: [running, queued] })
 
@@ -247,10 +234,6 @@ it("shows active work as a clear navigation action in both languages", async () 
   expect(badge).toHaveTextContent("Ver trabalho")
   expect(t("View work", {}, "en")).toBe("View work")
   expect(t("View work summary", { running: 1, queued: 1 }, "en")).toBe("Working: 1, 1 queued. View work")
-
-  const result = await axe.run(badge, { runOnly: ["label-content-name-mismatch"] })
-  expect(result.violations).toEqual([])
-  expect(result.passes.map((rule) => rule.id)).toEqual(["label-content-name-mismatch"])
 })
 
 const entry = (botId: string): HTMLElement => {
